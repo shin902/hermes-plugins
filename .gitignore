@@ -1,0 +1,14 @@
+/spotify/
+/talk-desktop/
+/hermes-activity/
+/hindsight/
+/homeassistant/
+/memory-wiki/
+/model-providers/opencode-acp/
+
+__pycache__/
+*.py[cod]
+.install-metadata.json*
+/rss-monitor/delivery.json
+/rss-monitor/feeds.json
+/rss-monitor/policies.json
