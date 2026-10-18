@@ -3,6 +3,9 @@ import json
 import pathlib
 import shlex
 import unittest
+from unittest.mock import patch
+
+from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
 spec = importlib.util.spec_from_file_location('research_fetch_test', pathlib.Path(__file__).with_name('__init__.py'))
 p = importlib.util.module_from_spec(spec)
@@ -14,12 +17,40 @@ class Context:
         self.calls = []
         self.result = result if result is not None else {'exit_code': 0, 'output': '# Video\n[00:01] text\n'}
     def register_tool(self, **kw): self.tools[kw['name']] = kw
+    def register_skill(self, name, path): pass
     def dispatch_tool(self, name, args):
         self.calls.append((name, args))
         if isinstance(self.result, Exception): raise self.result
         return self.result
 
 class Tests(unittest.TestCase):
+    def test_profile_skills(self):
+        # Exercise the real namespacing/path registrar without writing skill files.
+        for home, present in (
+            ('/profiles/default', {0, 1}),
+            ('/profiles/other', set()),
+            ('/profiles/partial', {1}),
+        ):
+            with self.subTest(home=home):
+                paths = [pathlib.Path(home) / 'skills' / relative for relative in (
+                    'media/youtube-transcript/SKILL.md',
+                    'research/arxiv-research/SKILL.md')]
+                expected = {paths[i] for i in present}
+                manager = PluginManager()
+                ctx = PluginContext(PluginManifest(name='research-fetch'), manager)
+                with patch.dict('os.environ', {'HERMES_HOME': home}), \
+                     patch.object(pathlib.Path, 'is_file', autospec=True,
+                                  side_effect=lambda path: path in expected), \
+                     patch.object(pathlib.Path, 'exists', autospec=True,
+                                  side_effect=lambda path: path in expected), \
+                     patch.object(ctx, 'register_tool') as tools:
+                    p.register(ctx)
+                self.assertEqual({call.kwargs['name'] for call in tools.call_args_list},
+                                 {'youtube_transcript', 'arxiv_search'})
+                for i, name in enumerate(('youtube-transcript', 'arxiv-research')):
+                    self.assertEqual(manager.find_plugin_skill('research-fetch:' + name),
+                                     paths[i] if i in present else None)
+
     def test_register(self):
         c = Context(); p.register(c)
         self.assertEqual(set(c.tools), {'youtube_transcript', 'arxiv_search'})

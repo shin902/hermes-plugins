@@ -2,6 +2,7 @@
 import datetime
 import json
 import shlex
+from hermes_constants import get_hermes_home
 from urllib.parse import urlsplit
 
 CLI = '/workspace/research-cli/research_cli.py'
@@ -92,3 +93,11 @@ def register(ctx):
         ctx.register_tool(name=name, toolset='research-fetch', schema={
             'name': name, 'description': description,
             'parameters': {'type': 'object', 'properties': properties, 'required': required, 'additionalProperties': False}}, handler=handler)
+    skills_dir = get_hermes_home() / 'skills'
+    for name, relative_path in (
+        ('youtube-transcript', 'media/youtube-transcript/SKILL.md'),
+        ('arxiv-research', 'research/arxiv-research/SKILL.md'),
+    ):
+        skill_md = skills_dir / relative_path
+        if skill_md.is_file():
+            ctx.register_skill(name, skill_md)
