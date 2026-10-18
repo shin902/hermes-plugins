@@ -1,0 +1,6 @@
+name: hermes-cli
+version: 1.0.0
+kind: standalone
+description: Host Hermes CLI passthrough with cross-profile targets and direct chat launch guard
+provides_tools:
+  - hermes_cli

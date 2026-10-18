@@ -1,0 +1,9 @@
+name: host-github
+label: Host GitHub
+kind: standalone
+version: 1.0.0
+author: Local
+homepage: https://github.com/NousResearch/hermes-agent
+description: Bounded host-side GitHub CLI operations using the installed gh authentication.
+provides_tools:
+  - host_github

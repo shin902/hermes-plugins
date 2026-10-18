@@ -1,0 +1,5 @@
+name: mail-monitor
+version: 1.0.0
+description: Deterministic Outlook collection and confirmed publication through native cron
+provides_tools:
+  - mail_publish

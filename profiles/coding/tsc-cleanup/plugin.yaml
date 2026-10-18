@@ -1,0 +1,5 @@
+name: tsc-cleanup
+version: 0.1.0
+description: Stop TypeScript compiler processes in Hermes coding containers after tool calls.
+provides_hooks:
+  - post_tool_call

@@ -1,0 +1,6 @@
+name: research-fetch
+version: 0.1.0
+description: Sandboxed YouTube transcripts and arXiv search via existing Research CLI.
+provides_tools:
+  - youtube_transcript
+  - arxiv_search

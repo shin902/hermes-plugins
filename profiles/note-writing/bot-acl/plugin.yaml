@@ -1,0 +1,11 @@
+name: bot-acl
+version: "0.4.0"
+description: Group ACL, roster filtering, and on-demand bot consultations.
+provides_tools:
+  - ask_bot
+  - list_bot_peers
+  - bot_task
+provides_middleware:
+  - llm_request
+provides_hooks:
+  - pre_tool_call

@@ -1,0 +1,7 @@
+name: host-ops
+version: 1.0.0
+description: Bounded host diagnostics and allowlisted service and Hermes operations.
+author: Coding
+kind: standalone
+provides_tools:
+  - host_ops

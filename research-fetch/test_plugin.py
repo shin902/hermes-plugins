@@ -1,0 +1,51 @@
+import importlib.util
+import json
+import pathlib
+import shlex
+import unittest
+
+spec = importlib.util.spec_from_file_location('research_fetch_test', pathlib.Path(__file__).with_name('__init__.py'))
+p = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(p)
+
+class Context:
+    def __init__(self, result=None):
+        self.tools = {}
+        self.calls = []
+        self.result = result if result is not None else {'exit_code': 0, 'output': '# Video\n[00:01] text\n'}
+    def register_tool(self, **kw): self.tools[kw['name']] = kw
+    def dispatch_tool(self, name, args):
+        self.calls.append((name, args))
+        if isinstance(self.result, Exception): raise self.result
+        return self.result
+
+class Tests(unittest.TestCase):
+    def test_register(self):
+        c = Context(); p.register(c)
+        self.assertEqual(set(c.tools), {'youtube_transcript', 'arxiv_search'})
+        for t in c.tools.values(): self.assertFalse(t['schema']['parameters']['additionalProperties'])
+    def test_shell_injection(self):
+        value = "-x '; touch /tmp/pwn; $(id)\n`id`"
+        c = Context(); p.register(c)
+        data = json.loads(c.tools['arxiv_search']['handler']({'query': value, 'title': value}))
+        name, a = c.calls[0]; tokens = shlex.split(a['command'])
+        self.assertEqual(name, 'terminal'); self.assertEqual(a['timeout'], 90)
+        self.assertEqual(tokens[:3], ['python3', p.CLI, 'arxiv-search'])
+        self.assertEqual(tokens[-2:], ['--', value]); self.assertIn('--title=' + value, tokens)
+        self.assertIn('--no-save', tokens); self.assertIn('markdown', data)
+    def test_youtube(self):
+        argv = shlex.split(p.command('youtube_transcript', {'url': 'https://youtu.be/abc?x=1&y=2'}))
+        self.assertIn('--subtitles', argv); self.assertNotIn('--sub-langs', argv)
+        self.assertEqual(argv[-2], '--')
+    def test_validation(self):
+        for tool, args in [('youtube_transcript', {}), ('youtube_transcript', {'url':'https://x.com/a'}), ('arxiv_search', {'command':'id'}), ('arxiv_search', {'limit':True}), ('arxiv_search', {'limit':51}), ('arxiv_search', {'date_from':'2025-99-99'}), ('arxiv_search', {'query':'\x00'}), ('arxiv_search', {'sort':'bad'})]:
+            c = Context(); self.assertIn('error', json.loads(p.run(c, tool, args))); self.assertEqual(c.calls, [])
+    def test_markdown_passthrough(self):
+        c=Context(); self.assertEqual(json.loads(p.run(c, 'arxiv_search', {}))['markdown'], c.result['output'])
+    def test_errors(self):
+        for result in [RuntimeError('denied'), {'exit_code':1,'output':'API failed'}, {'error':'timeout'}, 'not json', {'exit_code':0}, []]:
+            self.assertIn('error', json.loads(p.run(Context(result), 'arxiv_search', {})))
+    def test_json_terminal(self):
+        self.assertEqual(json.loads(p.run(Context('{"exit_code":0,"output":"ok"}'), 'arxiv_search', {})), {'markdown':'ok'})
+
+if __name__ == '__main__': unittest.main()

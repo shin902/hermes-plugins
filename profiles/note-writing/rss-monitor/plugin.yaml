@@ -1,0 +1,5 @@
+name: rss-monitor
+version: 3.0.0
+description: Durable RSS collector and confirmed Discord publication on public Hermes APIs
+provides_tools:
+  - rss_publish

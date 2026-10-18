@@ -1,0 +1,8 @@
+name: host-android
+label: Host Android
+kind: standalone
+version: 1.0.0
+author: Local
+description: Bounded host-side Android emulator inspection, UI control, and verified MP4 evidence.
+provides_tools:
+  - host_android

@@ -1,0 +1,12 @@
+name: hermes-activity
+version: "0.2.0"
+manifest_version: 2
+api_version: 1
+description: "Activity page for Hermes Desktop with local session analytics and an annual provider-reported usage heatmap, token breakdowns and model summaries. Provider refresh uses existing credentials to read provider APIs. No telemetry."
+author: Hassan Kamel
+license: MIT
+homepage: https://github.com/hassan-kamel/hermes-activity
+tags: [desktop, analytics, usage, insights, activity]
+requires_hermes: ">=0.21.5"
+provides_commands:
+  - activity
