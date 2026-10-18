@@ -7,14 +7,46 @@ import signal
 import subprocess
 import sys
 import tempfile
+import contextvars
+import hashlib
+import re
+import time
+import uuid
 from pathlib import Path
+
+_AUDIT = contextvars.ContextVar('bot_acl_consult_audit', default=None)
+_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z')
+
+
+def _valid_id(value):
+    return value if isinstance(value, str) and _ID.fullmatch(value) else None
+
+
+def _audit(**updates):
+    state = _AUDIT.get()
+    if state is None:
+        return
+    state['record'].update(updates)
+    path = state['path']
+    # Atomic replacement; no question, reply, environment or stderr is recorded.
+    fd, temporary = tempfile.mkstemp(prefix='.audit-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(state['record'], stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 from hermes_constants import get_hermes_home
 from .policy import check
 
 TOOLSET = "bot_consult"
 DEPTH_ENV = "BOT_ACL_CONSULT_CHILD"
-MAX_TURNS = 100
+MAX_TURNS = 250  # Agent iterations, NOT individual tool invocations.
 PROMPT = (
     "You can consult another local bot with ask_bot from ordinary sessions. "
     "Use list_bot_peers to discover allowed teammates. Choose mode=new_session "
@@ -27,14 +59,14 @@ PROMPT = (
 )
 ASK_SCHEMA = {
     "name": "ask_bot",
-    "description": "Consult a same-group local bot and receive its reply in this tool result. Runs a bounded one-shot Hermes CLI, not a resident agent. Choose an isolated new session or the bot's existing Bot Chat. No automatic retry or mode switch.",
+    "description": "Consult a same-group local bot and receive its reply in this tool result. Runs a one-shot Hermes CLI (default no wall-clock limit), not a resident agent. Budget: 250 agent iterations. Choose an isolated new session or the bot's existing Bot Chat. No automatic retry or mode switch.",
     "parameters": {
         "type": "object", "additionalProperties": False,
         "properties": {
             "target": {"type": "string", "description": "Canonical local profile ID from list_bot_peers."},
             "message": {"type": "string", "description": "Your composed question and necessary context. The recipient does not automatically receive this conversation."},
             "mode": {"type": "string", "enum": ["new_session", "bot_chat"], "default": "new_session"},
-            "timeout_seconds": {"type": "integer", "minimum": 30, "maximum": 300, "default": 180},
+            "timeout_seconds": {"type": "integer", "oneOf": [{"const": 0}, {"minimum": 30, "maximum": 300}], "default": 0, "description": "0 disables wall-clock limits; finite values 30-300 seconds."},
         },
         "required": ["target", "message"],
     },
@@ -94,23 +126,79 @@ def _run(argv, payload, env, timeout, scratch):
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=output, stderr=errors,
                                 env=env, cwd=str(Path.home()), start_new_session=True)
         timed_out = False
+        deadline = time.monotonic() + timeout if timeout else None
+        offset, pending, init = 0, b'', None
+        dropping = False
+
+        def collect():
+            nonlocal offset, pending, init, dropping
+            # pread does not move the child's shared stdout file offset.
+            while True:
+                chunk = os.pread(output.fileno(), 65536, offset)
+                if not chunk:
+                    break
+                offset += len(chunk)
+                for part in chunk.splitlines(keepends=True):
+                    ended = part.endswith(b'\n')
+                    if not dropping:
+                        pending += part
+                        if len(pending) > 65536:
+                            pending, dropping = b'', True
+                        elif ended:
+                            try:
+                                record = json.loads(pending)
+                            except (ValueError, TypeError):
+                                record = None
+                            if isinstance(record, dict) and record.get('type') == 'system' and record.get('subtype') == 'init':
+                                sid = _valid_id(record.get('session_id'))
+                                if sid:
+                                    init = {'type': 'system', 'subtype': 'init', 'session_id': sid}
+                                    _audit(session_id=sid)
+                    if ended:
+                        pending, dropping = b'', False
+
         try:
-            try:
-                proc.communicate(input=payload.encode("utf-8"), timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _stop_group(proc)
+            _audit(pid=proc.pid, cleanup='pending', status='running')
+            first = True
+            while True:
+                try:
+                    remaining = None if deadline is None else max(.001, deadline - time.monotonic())
+                    proc.communicate(input=payload.encode('utf-8') if first else None,
+                                     timeout=.1 if remaining is None else min(.1, remaining))
+                    collect()
+                    break
+                except subprocess.TimeoutExpired:
+                    first = False
+                    collect()
+                    if deadline is not None and time.monotonic() >= deadline:
+                        timed_out = True
+                        _stop_group(proc)
+                        collect()
+                        break
         finally:
             # Reap on every exit path, but cleanup failures must not replace a
             # KeyboardInterrupt or another exception already in flight.
             if sys.exc_info()[0] is None:
-                _stop_group(proc)
+                try:
+                    _stop_group(proc)
+                    collect()
+                    _audit(cleanup='reaped')
+                except BaseException:
+                    _audit(cleanup='failed')
+                    raise
             else:
                 try:
                     _stop_group(proc)
+                    collect()
+                    _audit(cleanup='reaped')
                 except Exception:
-                    logging.getLogger(__name__).exception("bot-acl: consultation cleanup failed during interruption")
-        return proc.returncode, _tail(output), _tail(errors, 8192), timed_out
+                    try:
+                        _audit(cleanup='failed')
+                    except Exception:
+                        pass
+                    logging.getLogger(__name__).error("bot-acl: consultation cleanup failed during interruption")
+        prefix = json.dumps(init) + '\n' if init else ''
+        return proc.returncode, prefix + _tail(output), _tail(errors, 8192), timed_out
 
 
 def _outcome(code, output, errors, timed_out, target, mode):
@@ -127,10 +215,18 @@ def _outcome(code, output, errors, timed_out, target, mode):
     # A nonzero CLI exit may still carry a persisted summary. Keep it as
     # explicitly partial evidence, never as a successful/completed reply.
     evidence = {}
-    session_id = (result or {}).get("session_id")
-    if not isinstance(session_id, str) or not session_id:
-        session_id = next((line.removeprefix("session_id: ") for line in reversed(errors.splitlines())
-                           if line.startswith("session_id: ")), None)
+    session_id = _valid_id((result or {}).get("session_id"))
+    if not session_id:
+        for line in output.splitlines():
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(record, dict) and record.get('type') == 'system' and record.get('subtype') == 'init':
+                session_id = _valid_id(record.get('session_id')) or session_id
+    if not session_id:
+        session_id = next((_valid_id(line.removeprefix("session_id: ")) for line in reversed(errors.splitlines())
+                           if line.startswith("session_id: ") and _valid_id(line.removeprefix("session_id: "))), None)
     if session_id:
         evidence["session_id"] = session_id
     text = (result or {}).get("text")
@@ -146,7 +242,7 @@ def _outcome(code, output, errors, timed_out, target, mode):
     if code != 0 and "hermes-refusal-reason: SESSION_NOT_OWNED" in errors.splitlines():
         return {**base, "status": "target_busy", "error": "The recipient session is owned by another live process; this CLI turn was refused.",
                 "next_step": "If the same question does not require Bot Chat history, call ask_bot again with the same target/message and mode=new_session. Otherwise report that Bot Chat is busy. Do not loop or start a watcher."}
-    if code != 0 or not result or result.get("exit_code") != 0 or result.get("error"):
+    if code != 0 or not result or result.get("exit_code") != 0 or result.get("error") or result.get("partial") or result.get("completed") is False or result.get("status") in ("cancelled", "timeout", "partial", "interrupted"):
         return {**base, "status": "failed", "exit_code": code,
                 **evidence,
                 "error": str((result or {}).get("error") or diagnostics[-2000:] or
@@ -160,24 +256,25 @@ def _outcome(code, output, errors, timed_out, target, mode):
             "reply": reply[:32000], "truncated": len(reply) > 32000}
 
 
-def ask(domains, args, **kwargs):
+def _ask(domains, args, **kwargs):
     try:
         if os.environ.get(DEPTH_ENV) == "1":
             return json.dumps({"status": "blocked", "error": "Nested ask_bot consultations are disabled for one-shot recipients."})
         mode = args.get("mode", "new_session")
         message = args.get("message")
-        timeout = args.get("timeout_seconds", 180)
+        timeout = args.get("timeout_seconds", 0)
         if mode not in ("new_session", "bot_chat"):
             raise ValueError("mode must be new_session or bot_chat")
         if not isinstance(message, str) or not message.strip() or len(message) > 16000:
             raise ValueError("message must contain 1-16000 characters")
-        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 30 <= timeout <= 300:
-            raise ValueError("timeout_seconds must be an integer between 30 and 300")
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not (timeout == 0 or 30 <= timeout <= 300):
+            raise ValueError("timeout_seconds must be 0 (unlimited) or an integer between 30 and 300")
         denied = check(domains, "message_agent", args)
         if denied:
             return json.dumps({"status": "blocked", "error": denied["message"]}, ensure_ascii=False)
         raw = args["target"].strip().removeprefix("@")
         target = "default" if raw == "hermes" else raw
+        _audit(target=target)
         source, root = identity()
         executable = shutil.which("hermes")
         if not executable:
@@ -204,6 +301,43 @@ def ask(domains, args, **kwargs):
         return json.dumps(_outcome(code, output, errors, timed_out, target, mode), ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"status": "failed", "resident": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def ask(domains, args, **kwargs):
+    request_id = uuid.uuid4().hex
+    directory = Path(get_hermes_home()) / 'state' / 'bot-acl' / 'consult-audit'
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state = {'path': directory / (request_id + '.json'), 'record': {
+        'request_id': request_id,
+        'implementation_hash': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'pid': None, 'start': time.time(), 'end': None,
+        'target': args.get('target') if _valid_id(args.get('target')) else 'invalid',
+        'mode': args.get('mode', 'new_session') if args.get('mode', 'new_session') in ('new_session', 'bot_chat') else 'invalid',
+        'session_id': 'unknown', 'status': 'starting', 'cleanup': 'not_started'}}
+    token = _AUDIT.set(state)
+    try:
+        _audit()
+        response = json.loads(_ask(domains, args, **kwargs))
+        _audit(status=response['status'], session_id=response.get('session_id') or state['record']['session_id'])
+        response['request_id'] = request_id
+        return json.dumps(response, ensure_ascii=False)
+    except BaseException:
+        # Cancellation remains an interruption, never a completed tool reply.
+        try:
+            _audit(status='cancelled_unknown')
+        except Exception:
+            logging.getLogger(__name__).error('bot-acl: audit update failed')
+        raise
+    finally:
+        interrupted = sys.exc_info()[0] is not None
+        try:
+            _audit(end=time.time())
+        except Exception:
+            if not interrupted:
+                raise
+            logging.getLogger(__name__).error('bot-acl: final audit write failed')
+        finally:
+            _AUDIT.reset(token)
 
 
 def register_consult(ctx, domains):

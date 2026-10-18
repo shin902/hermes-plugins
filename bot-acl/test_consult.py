@@ -56,8 +56,8 @@ class ConsultTests(unittest.TestCase):
         self.assertIn('@coding',payload)
         self.assertEqual(env['HERMES_HOME'],str(self.root/'profiles/mail'))
         self.assertEqual(env[consult.DEPTH_ENV],'1')
-        self.assertEqual(timeout,180)
-        self.assertEqual(argv[argv.index('--max-turns')+1], '100')
+        self.assertEqual(timeout,0)
+        self.assertEqual(argv[argv.index('--max-turns')+1], '250')
         self.assertEqual(scratch,self.root/'profiles/coding/cache/scratch')
 
     def test_bot_chat_resume_without_creation(self):
