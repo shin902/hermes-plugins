@@ -1,8 +1,10 @@
 name: host-transfer
 label: Host File Transfer
 kind: standalone
-version: 0.1.0
+version: 0.2.0
 author: Local
 description: Bounded host-side SSH file transfer to a named remote (currently the Mac's Downloads folder).
 provides_tools:
   - host_transfer
+provides_hooks:
+  - pre_tool_call

@@ -30,6 +30,22 @@ minimal environment that does not inherit ambient credentials. It invokes
 `StrictHostKeyChecking=accept-new`, a fixed `UserKnownHostsFile`, the fixed identity file,
 `IdentitiesOnly=yes`) so an unreadable host/system SSH config cannot break the transfer.
 
+## Human approval
+
+Every `host_transfer` call is escalated to the human-approval gate through a `pre_tool_call`
+hook that returns `{"action": "approve", "rule_key": "host_transfer"}`. This is the same gate
+that guards dangerous shell commands (`tools/approval.py`), so:
+
+- The agent cannot run a transfer without an explicit human decision (`once`/`session`/`always`
+  or `deny`). `always`/`session` answers are the user's own opt-out and are remembered under the
+  `host_transfer` rule key; omit them to be prompted every time.
+- `approvals.mode: smart` does **not** auto-approve it — the plugin gate always asks a human.
+- In a non-interactive context with no approval surface (cron, `-q`, headless), it fails
+  **closed**: the call is blocked rather than run.
+
+If you need a prompt on *every single* call even if the user previously chose `always`, change
+the hook's `rule_key` to a per-call unique value.
+
 ## Trust and configuration
 
 Paths, host, user, identity file, and the remote directory are constants specific to this

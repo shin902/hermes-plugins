@@ -245,6 +245,24 @@ def handle(args: dict[str, Any], **kwargs: Any) -> str:
         return json.dumps({"ok": False, "error": _redact(type(exc).__name__ + ": " + str(exc))}, ensure_ascii=False)
 
 
+def _pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, **_: Any) -> Optional[dict[str, Any]]:
+    """Escalate every host_transfer call to the human-approval gate (the same gate as dangerous
+    shell commands), so the agent cannot copy a file to the Mac without explicit consent. Returns
+    None for every other tool so this hook never affects unrelated calls."""
+    if tool_name != "host_transfer":
+        return None
+    call = args if isinstance(args, dict) else {}
+    params = call.get("params") if isinstance(call.get("params"), dict) else {}
+    action = call.get("action")
+    target = params.get("target", "mac")
+    if action == "send":
+        reason = f"send {params.get('local_path', '(unresolved path)')} to {target} over SSH into ~/Downloads"
+    else:
+        reason = f"run {action or 'this action'} against {target} over SSH"
+    return {"action": "approve", "message": reason, "rule_key": "host_transfer"}
+
+
 def register(ctx: Any) -> None:
+    ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_tool(name="host_transfer", toolset="host_transfer", schema=SCHEMA, handler=handle,
                       description="Transfer a host file to an allowlisted remote over SSH with verified checksums.")

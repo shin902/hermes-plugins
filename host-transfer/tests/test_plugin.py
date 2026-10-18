@@ -156,5 +156,25 @@ class HandleTests(unittest.TestCase):
         self.assertNotIn("hunter2", ht._redact("password=hunter2"))
 
 
+class ApprovalHookTests(unittest.TestCase):
+    def test_only_host_transfer_is_escalated(self):
+        self.assertIsNone(ht._pre_tool_call(tool_name="terminal", args={}))
+        self.assertIsNone(ht._pre_tool_call(tool_name="host_github", args={"repo": "a/b"}))
+
+    def test_send_is_escalated_with_a_readable_reason(self):
+        directive = ht._pre_tool_call(
+            tool_name="host_transfer",
+            args={"action": "send", "params": {"local_path": "/home/shi/report.pdf", "confirm": True}},
+        )
+        self.assertEqual(directive["action"], "approve")
+        self.assertEqual(directive["rule_key"], "host_transfer")
+        self.assertIn("/home/shi/report.pdf", directive["message"])
+        self.assertIn("mac", directive["message"])
+
+    def test_probe_is_escalated_and_tolerates_missing_args(self):
+        self.assertEqual(ht._pre_tool_call(tool_name="host_transfer")["action"], "approve")
+        self.assertEqual(ht._pre_tool_call(tool_name="host_transfer", args={"action": "probe"})["action"], "approve")
+
+
 if __name__ == "__main__":
     unittest.main()
