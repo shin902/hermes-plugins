@@ -5,13 +5,19 @@
       "profile": "default",
       "plugin": "bot-acl",
       "source": "bot-acl",
-      "version": "0.4.0"
+      "version": "0.5.0"
     },
     {
       "profile": "default",
       "plugin": "hermes-activity",
       "source": "profiles/default/hermes-activity",
       "version": "0.2.0"
+    },
+    {
+      "profile": "default",
+      "plugin": "host-transfer",
+      "source": "host-transfer",
+      "version": "0.1.0"
     },
     {
       "profile": "default",
@@ -69,6 +75,12 @@
     },
     {
       "profile": "coding",
+      "plugin": "host-transfer",
+      "source": "host-transfer",
+      "version": "0.1.0"
+    },
+    {
+      "profile": "coding",
       "plugin": "orca-status",
       "source": "profiles/coding/orca-status",
       "version": "1.0.0"
@@ -95,25 +107,25 @@
       "profile": "finance",
       "plugin": "bot-acl",
       "source": "bot-acl",
-      "version": "0.4.0"
+      "version": "0.5.0"
     },
     {
       "profile": "local",
       "plugin": "bot-acl",
       "source": "bot-acl",
-      "version": "0.4.0"
+      "version": "0.5.0"
     },
     {
       "profile": "logbook",
       "plugin": "bot-acl",
       "source": "bot-acl",
-      "version": "0.4.0"
+      "version": "0.5.0"
     },
     {
       "profile": "mail",
       "plugin": "bot-acl",
       "source": "bot-acl",
-      "version": "0.4.0"
+      "version": "0.5.0"
     },
     {
       "profile": "mail",
@@ -167,7 +179,7 @@
       "profile": "screenpipe",
       "plugin": "bot-acl",
       "source": "bot-acl",
-      "version": "0.4.0"
+      "version": "0.5.0"
     }
   ]
 }
