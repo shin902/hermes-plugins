@@ -12,6 +12,32 @@ import hashlib
 import re
 import time
 import uuid
+import fcntl
+from contextlib import contextmanager
+
+
+@contextmanager
+def _receiver_lock(root, target, mode, request_id):
+    """Cross-caller nonblocking admission; native CLI session ownership still applies.
+
+    Never unlink lock files: unlinking permits two different locked inodes.
+    Failure to open/lock is an error, never permission to launch a child.
+    """
+    directory = root / 'state' / 'bot-acl' / 'consult-locks'
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = json.dumps([target, 'Bot Chat' if mode == 'bot_chat' else request_id])
+    path = directory / (hashlib.sha256(key.encode()).hexdigest() + '.lock')
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            pass
+        yield acquired
+    finally:
+        os.close(fd)
 from pathlib import Path
 
 _AUDIT = contextvars.ContextVar('bot_acl_consult_audit', default=None)
@@ -297,7 +323,14 @@ def _ask(domains, args, **kwargs):
                    "Do not launch background agents, daemons, watchers, or polling loops. "
                    "Do not message the sender separately; your final answer is returned to them.\n\n"
                    + message)
-        code, output, errors, timed_out = _run(argv, payload, env, timeout, scratch)
+        state = _AUDIT.get()
+        request_id = state['record']['request_id'] if state else uuid.uuid4().hex
+        with _receiver_lock(root, target, mode, request_id) as acquired:
+            if not acquired:
+                return json.dumps({"target": target, "mode": mode, "resident": False,
+                    "status": "target_busy", "error": "Another ask_bot process owns this recipient session admission lock.",
+                    "next_step": "Use mode=new_session if Bot Chat history is unnecessary; otherwise report busy. Do not automatically retry."})
+            code, output, errors, timed_out = _run(argv, payload, env, timeout, scratch)
         return json.dumps(_outcome(code, output, errors, timed_out, target, mode), ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"status": "failed", "resident": False, "error": str(exc)}, ensure_ascii=False)
