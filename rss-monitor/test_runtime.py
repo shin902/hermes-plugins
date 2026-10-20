@@ -150,6 +150,47 @@ class StateTests(unittest.TestCase):
         self.assertNotIn('password',data['source_url'])
         self.assertNotIn('secret',data['source_url'])
         self.assertIn('channel_id=public',data['source_url'])
+    def test_profile_configs_and_runtime_state_are_isolated(self):
+        homes = {name: self.home / name for name in ('my-dot', 'note-writing')}
+        for name, profile_home in homes.items():
+            config = profile_home / 'plugin-config/rss-monitor'
+            config.mkdir(parents=True)
+            (config / 'feeds.json').write_text(json.dumps({name: f'https://{name}.example/feed'}))
+            (config / 'delivery.json').write_text(json.dumps({name: f'discord:{1 if name == "my-dot" else 2}'}))
+            (config / 'policies.json').write_text(json.dumps({name: {
+                'exclude_youtube_shorts': True, 'batch_limit': 1 if name == 'my-dot' else 6}}))
+            path = profile_home / 'cron/rss-monitor' / f'{name}.json'
+            state = r.initial(f'https://{name}.example/feed', [])
+            state['pending'] = [dict(ITEM, id=f'{name}-{n}', url=f'https://example.com/{name}/{n}')
+                                for n in range(2)]
+            r.write(path, state)
+
+        for name, profile_home in homes.items():
+            with patch.object(pkg, 'home', return_value=profile_home):
+                feeds, targets = pkg.settings()
+                self.assertEqual(set(feeds), {name})
+                self.assertEqual(set(targets), {name})
+                self.assertTrue(r.excludes_shorts(name))
+                self.assertFalse(r.excludes_shorts('other'))
+                output = json.loads(r.prepare(profile_home, name))
+                self.assertEqual(len(output['items']), 1 if name == 'my-dot' else 2)
+                self.assertTrue((profile_home / 'cron/rss-monitor' / f'{name}.json').exists())
+                self.assertFalse((homes['note-writing' if name == 'my-dot' else 'my-dot']
+                                  / 'cron/rss-monitor' / f'{name}.json').exists())
+
+    def test_invalid_batch_limit_preserves_pending(self):
+        config = self.home / 'plugin-config/rss-monitor'
+        config.mkdir(parents=True)
+        path = self.home / 'cron/rss-monitor/job.json'
+        state = r.initial('https://example.com/feed', [])
+        state['pending'] = [ITEM]
+        r.write(path, state)
+        for limit in (0, 7, True, '6'):
+            (config / 'policies.json').write_text(json.dumps({'job': {'batch_limit': limit}}))
+            with patch.object(pkg, 'home', return_value=self.home):
+                with self.assertRaises(ValueError): r.prepare(self.home, 'job')
+            self.assertEqual(r.read(path)['pending'], [ITEM])
+
     def test_utf16_chunks_fit_discord(self):
         text='😀'*4000
         parts=r.chunks(text)

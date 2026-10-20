@@ -39,6 +39,8 @@ def reconcile(repo, home, mapping, apply=False):
         if (profile, plugin) in seen:
             raise ValueError('Duplicate mapping')
         seen.add((profile, plugin))
+        if entry['source'] != plugin:
+            raise ValueError('Each plugin must use its canonical repository source')
         source = repo / safe_parts(entry['source'])
         if not source.is_dir() or source.is_symlink() or not source.resolve().is_relative_to(repo):
             raise ValueError('Missing or redirected source')

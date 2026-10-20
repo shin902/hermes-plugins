@@ -12,6 +12,7 @@ import subprocess
 import time
 import uuid
 
+from . import config_dir
 from .monitor import EMPTY_OUTPUT, MAX_OUTPUT_CHARS, TransientFetchError, fetch_feed
 
 
@@ -114,8 +115,8 @@ def collect(home: Path, job_id: str, url: str, *, now: float | None = None) -> d
 
 
 def excludes_shorts(job_id: str) -> bool:
-    path = Path(__file__).with_name('policies.json')
-    policies = json.loads(path.read_text()) if path.exists() else {}
+    path = config_dir() / 'policies.json'
+    policies = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     return policies.get(job_id, {}).get('exclude_youtube_shorts') is True
 
 
@@ -169,7 +170,14 @@ def prepare(home: Path, job_id: str) -> str:
             raise ValueError('RSS delivery unknown/partially sent; batch retained; manual reconciliation required')
         if not current and state['pending']:
             batch = []
-            batch_limit = 1 if job_id in json.loads(Path(__file__).with_name('feeds.json').read_text(encoding='utf-8')) else 6
+            feeds_path = config_dir() / 'feeds.json'
+            feeds = json.loads(feeds_path.read_text(encoding='utf-8')) if feeds_path.exists() else {}
+            batch_limit = 1 if job_id in feeds else 6
+            policies_path = config_dir() / 'policies.json'
+            policies = json.loads(policies_path.read_text(encoding='utf-8')) if policies_path.exists() else {}
+            batch_limit = policies.get(job_id, {}).get('batch_limit', batch_limit)
+            if type(batch_limit) is not int or not 1 <= batch_limit <= 6:
+                raise ValueError('RSS batch_limit must be an integer between 1 and 6')
             while state['pending'] and len(batch) < batch_limit:
                 candidate = batch + [state['pending'][0]]
                 if len(json.dumps({'items': candidate}, ensure_ascii=False)) > MAX_OUTPUT_CHARS - 300:

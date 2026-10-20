@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, symlink, copyFile, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, symlink, writeFile, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -11,13 +11,13 @@ import { test } from "node:test";
 // HERMES_HOME (plugins symlinked in, cache pre-seeded) with no --refresh, so it
 // must answer purely from the local archive and never touch the network.
 async function hermeticHome():Promise<string>{
-  const base=join(homedir(),".hermes/cache/scratch");
+  const base=process.env.TMPDIR||join(homedir(),".hermes/cache/scratch");
   await mkdir(base,{recursive:true});
   const home=await mkdtemp(join(base,"activity-cli-test-"));
-  const realHome=process.env.HERMES_HOME||join(homedir(),".hermes");
-  await symlink(join(realHome,"plugins"),join(home,"plugins"));
-  const config=join(realHome,"config.yaml");
-  if(existsSync(config))await copyFile(config,join(home,"config.yaml"));
+  await mkdir(join(home,"plugins"));
+  const pluginRoot=resolve(dirname(fileURLToPath(import.meta.url)),"..");
+  await symlink(pluginRoot,join(home,"plugins/hermes-activity"));
+  await writeFile(join(home,"config.yaml"),"plugins:\n  enabled: [hermes-activity]\n");
   await writeFile(join(home,"activity_provider_history.json"),JSON.stringify({schema_version:1,checked_at:"2026-10-12T00:00:00Z",providers:{
     "opencode-go":{status:"available",scope:"workspace",source:"OpenCode v2 CSV export",data_as_of:"2026-10-11T00:00:00Z",reason:null,note:"",periods:[],fetched_at:"2026-10-11T00:00:00Z",scope_hash:"abc",daily:[{day:"2026-10-05",requests:3,tokens:300,input_tokens:100,output_tokens:200,cache_read_tokens:50,cache_write_tokens:null,reasoning_tokens:0,cost_usd:"0.1200"}]},
     "ollama":{status:"auth-required",scope:"account",source:"https://ollama.com/api/usage",data_as_of:null,reason:"no-credentials",note:"",periods:[],daily:[],fetched_at:null,scope_hash:""},
@@ -43,7 +43,7 @@ const HERMES=resolveHermes();
 
 function runCli(home:string,args:string[],env:EnvOverride={}):string{
   return execFileSync(HERMES,["activity","provider-history",...args],{
-    env:{...process.env,HERMES_HOME:home,...env},
+    env:{...process.env,HERMES_HOME:home,HERMES_PROFILE:"",...env},
     encoding:"utf-8",
     timeout:120000,
   });
@@ -73,9 +73,10 @@ test("real CLI answers provider-history from cache with no --refresh",async()=>{
 
 test("glue reports a missing node runtime explicitly instead of crashing",async()=>{
   const pluginRoot=resolve(dirname(fileURLToPath(import.meta.url)),"..");
-  const linkParent=await mkdtemp(join(homedir(),".hermes/cache/scratch","activity-pkg-"));
+  const scratch=process.env.TMPDIR||join(homedir(),".hermes/cache/scratch");
+  const linkParent=await mkdtemp(join(scratch,"activity-pkg-"));
   await symlink(pluginRoot,join(linkParent,"activity_pkg"));
-  const emptyBin=await mkdtemp(join(homedir(),".hermes/cache/scratch","emptybin-"));
+  const emptyBin=await mkdtemp(join(scratch,"emptybin-"));
   const script=[
     "import json,os,sys",
     `os.environ['PATH']=${JSON.stringify(emptyBin)}`,

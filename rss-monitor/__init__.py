@@ -9,8 +9,12 @@ def home():
     return get_hermes_home()
 
 
+def config_dir():
+    return Path(home()) / 'plugin-config/rss-monitor'
+
+
 def settings():
-    directory = Path(__file__).parent
+    directory = config_dir()
     feeds = json.loads((directory / 'feeds.json').read_text(encoding='utf-8'))
     targets = json.loads((directory / 'delivery.json').read_text(encoding='utf-8'))
     if set(feeds) != set(targets):
