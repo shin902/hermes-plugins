@@ -31,7 +31,9 @@ the root bot-acl implementation (including unlimited consultation time and resum
 for all mapped profiles. Identical Orca and Activity copies were deduplicated;
 single-profile plugins and the custom provider were relocated without code changes.
 RSS processes exactly one article per run, with profile-local Shorts exclusion policies.
-hermes-activity is ordinary source, not a nested Git repository.
+hermes-activity is installed directly from https://github.com/hassan-kamel/hermes-activity
+in the default and my-dot profiles, outside this repository and deployment manifest.
+Update it with `hermes -p <profile> plugins update hermes-activity`.
 Unification does not change activation settings or restart Hermes.
 
 Full pre-cutover hash/mode-verified snapshots and retired originals are outside
