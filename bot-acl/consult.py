@@ -5,6 +5,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import contextvars
@@ -13,7 +14,7 @@ import re
 import time
 import uuid
 import fcntl
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 
 @contextmanager
@@ -77,7 +78,8 @@ PROMPT = (
     "You can consult another local bot with ask_bot from ordinary sessions. "
     "Use list_bot_peers to discover allowed teammates. Choose mode=new_session "
     "for an isolated consultation, or mode=bot_chat to continue the recipient's "
-    "existing Bot Chat. Default to new_session when persistent Bot Chat context "
+    "existing Bot Chat. Use mode=resume with target and session_id to continue a "
+    "specific returned consultation session. Default to new_session when persistent Bot Chat context "
     "is unnecessary. If bot_chat returns target_busy, follow its next_step; "
     "do not repeatedly retry the busy chat. Replies are tool results, not later "
     "notifications. Calls are bounded one-shot runs: never start a resident agent, "
@@ -85,13 +87,14 @@ PROMPT = (
 )
 ASK_SCHEMA = {
     "name": "ask_bot",
-    "description": "Consult a same-group local bot and receive its reply in this tool result. Runs a one-shot Hermes CLI (default no wall-clock limit), not a resident agent. Budget: 250 agent iterations. Choose an isolated new session or the bot's existing Bot Chat. No automatic retry or mode switch.",
+    "description": "Consult a same-group local bot and receive its reply in this tool result. Runs a one-shot Hermes CLI (default no wall-clock limit), not a resident agent. Budget: 250 agent iterations. Choose new_session, existing bot_chat, or resume with an exact session_id. No automatic retry or mode switch.",
     "parameters": {
         "type": "object", "additionalProperties": False,
         "properties": {
             "target": {"type": "string", "description": "Canonical local profile ID from list_bot_peers."},
             "message": {"type": "string", "description": "Your composed question and necessary context. The recipient does not automatically receive this conversation."},
-            "mode": {"type": "string", "enum": ["new_session", "bot_chat"], "default": "new_session"},
+            "mode": {"type": "string", "enum": ["new_session", "bot_chat", "resume"], "default": "new_session"},
+            "session_id": {"type": "string", "description": "Required only for mode=resume: exact session ID in the target profile, not a title or latest. Compression continuations follow the CLI's normal resume rules."},
             "timeout_seconds": {"type": "integer", "oneOf": [{"const": 0}, {"minimum": 30, "maximum": 300}], "default": 0, "description": "0 disables wall-clock limits; finite values 30-300 seconds."},
         },
         "required": ["target", "message"],
@@ -121,7 +124,7 @@ def list_peers(domains, args, **kwargs):
         peers = [name for name in sorted(candidates) if name != source
                  and check(domains, "message_agent", {"target": name}) is None]
         return json.dumps({"source": source, "peers": peers,
-                           "modes": ["new_session", "bot_chat"]}, ensure_ascii=False)
+                           "modes": ["new_session", "bot_chat", "resume"]}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False)
 
@@ -267,7 +270,8 @@ def _outcome(code, output, errors, timed_out, target, mode):
     # Prefer a typed refusal, not text from model output (which may quote errors).
     if code != 0 and "hermes-refusal-reason: SESSION_NOT_OWNED" in errors.splitlines():
         return {**base, "status": "target_busy", "error": "The recipient session is owned by another live process; this CLI turn was refused.",
-                "next_step": "If the same question does not require Bot Chat history, call ask_bot again with the same target/message and mode=new_session. Otherwise report that Bot Chat is busy. Do not loop or start a watcher."}
+                "next_step": ("Report this session as busy. Do not automatically retry or switch sessions."
+                              if mode == "resume" else "If the same question does not require Bot Chat history, call ask_bot again with the same target/message and mode=new_session. Otherwise report that Bot Chat is busy. Do not loop or start a watcher.")}
     if code != 0 or not result or result.get("exit_code") != 0 or result.get("error") or result.get("partial") or result.get("completed") is False or result.get("status") in ("cancelled", "timeout", "partial", "interrupted"):
         return {**base, "status": "failed", "exit_code": code,
                 **evidence,
@@ -289,8 +293,14 @@ def _ask(domains, args, **kwargs):
         mode = args.get("mode", "new_session")
         message = args.get("message")
         timeout = args.get("timeout_seconds", 0)
-        if mode not in ("new_session", "bot_chat"):
-            raise ValueError("mode must be new_session or bot_chat")
+        if mode not in ("new_session", "bot_chat", "resume"):
+            raise ValueError("mode must be new_session, bot_chat or resume")
+        session_id = args.get("session_id")
+        if mode == "resume":
+            if not _valid_id(session_id) or session_id.lower() == "latest":
+                raise ValueError("resume requires an exact session_id, not a title or latest")
+        elif "session_id" in args:
+            raise ValueError("session_id is only allowed with mode=resume")
         if not isinstance(message, str) or not message.strip() or len(message) > 16000:
             raise ValueError("message must contain 1-16000 characters")
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not (timeout == 0 or 30 <= timeout <= 300):
@@ -306,6 +316,13 @@ def _ask(domains, args, **kwargs):
         if not executable:
             raise RuntimeError("Hermes CLI is not available on this host")
         target_home = root if target == "default" else root / "profiles" / target
+        if mode == "resume":
+            # CLI accepts titles too. Check exact IDs read-only in the selected
+            # profile; leave compression and live-writer ownership to the CLI.
+            with closing(sqlite3.connect((target_home / "state.db").as_uri() + "?mode=ro", uri=True)) as db:
+                if not db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
+                    raise ValueError("session_id not found in target profile")
+            _audit(session_id=session_id)
         env = dict(os.environ)
         env["HERMES_HOME"] = str(target_home)
         env[DEPTH_ENV] = "1"
@@ -318,6 +335,8 @@ def _ask(domains, args, **kwargs):
         if mode == "bot_chat":
             # Resume only; do not create a look-alike Bot Chat if none exists.
             argv += ["--continue", "Bot Chat"]
+        elif mode == "resume":
+            argv += ["--resume=" + session_id]
         payload = (f"Consultation from @{source}. Reply to this request in your final answer. "
                    "This is a bounded one-shot consultation, not a resident worker. "
                    "Do not launch background agents, daemons, watchers, or polling loops. "
@@ -325,13 +344,17 @@ def _ask(domains, args, **kwargs):
                    + message)
         state = _AUDIT.get()
         request_id = state['record']['request_id'] if state else uuid.uuid4().hex
-        with _receiver_lock(root, target, mode, request_id) as acquired:
+        with _receiver_lock(root, target, mode, session_id if mode == "resume" else request_id) as acquired:
             if not acquired:
                 return json.dumps({"target": target, "mode": mode, "resident": False,
+                    **({"session_id": session_id} if mode == "resume" else {}),
                     "status": "target_busy", "error": "Another ask_bot process owns this recipient session admission lock.",
-                    "next_step": "Use mode=new_session if Bot Chat history is unnecessary; otherwise report busy. Do not automatically retry."})
+                    "next_step": "Report this session as busy. Use mode=new_session only if its history is unnecessary. Do not automatically retry."})
             code, output, errors, timed_out = _run(argv, payload, env, timeout, scratch)
-        return json.dumps(_outcome(code, output, errors, timed_out, target, mode), ensure_ascii=False)
+        outcome = _outcome(code, output, errors, timed_out, target, mode)
+        if mode == "resume" and not outcome.get("session_id"):
+            outcome["session_id"] = session_id
+        return json.dumps(outcome, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"status": "failed", "resident": False, "error": str(exc)}, ensure_ascii=False)
 
@@ -345,7 +368,7 @@ def ask(domains, args, **kwargs):
         'implementation_hash': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         'pid': None, 'start': time.time(), 'end': None,
         'target': args.get('target') if _valid_id(args.get('target')) else 'invalid',
-        'mode': args.get('mode', 'new_session') if args.get('mode', 'new_session') in ('new_session', 'bot_chat') else 'invalid',
+        'mode': args.get('mode', 'new_session') if args.get('mode', 'new_session') in ('new_session', 'bot_chat', 'resume') else 'invalid',
         'session_id': 'unknown', 'status': 'starting', 'cleanup': 'not_started'}}
     token = _AUDIT.set(state)
     try:

@@ -2,11 +2,14 @@
 import ast
 import json
 import os
+import sqlite3
+import select
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch, Mock
+from contextlib import closing
 
 from test_acl import acl
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -66,6 +69,74 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(argv[-2:],['--continue','Bot Chat'])
         self.assertNotIn('--create-if-missing',argv)
         self.assertEqual(result['mode'],'bot_chat')
+
+    def recipient_session(self, target='mail', sid='test-recipient'):
+        home = self.root if target == 'default' else self.root / 'profiles' / target
+        with closing(sqlite3.connect(home / 'state.db')) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)')
+            db.execute('INSERT INTO sessions VALUES (?)', (sid,))
+            db.commit()
+        return sid
+
+    def test_resume_exact_id_and_profile(self):
+        for target in ('mail', 'default'):
+            sid = self.recipient_session(target)
+            result, run = self.call({**self.args, 'target': target, 'mode': 'resume', 'session_id': sid})
+            self.assertEqual(result['status'], 'completed', result)
+            argv, _, env, _, _ = run.call_args.args
+            self.assertEqual(argv[-1], '--resume=' + sid)
+            self.assertEqual(argv[2], target)
+            self.assertNotIn('--continue', argv)
+            self.assertNotIn('--create-if-missing', argv)
+            self.assertEqual(result['session_id'], sid)
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(env['HERMES_HOME'], str(self.root if target == 'default' else self.root / 'profiles' / target))
+
+    def test_resume_rejects_untrusted_and_wrong_mode_ids(self):
+        for sid in (None, '', 'latest', 'LATEST', '--provider=evil', '../state', 'x;false', 'x\n-y', 'x'*129, 123, ' Bot Chat'):
+            result, run = self.call({**self.args, 'mode': 'resume', 'session_id': sid})
+            self.assertEqual(result['status'], 'failed', sid)
+            run.assert_not_called()
+        for mode in ('new_session', 'bot_chat'):
+            result, run = self.call({**self.args, 'mode': mode, 'session_id': 'test-recipient'})
+            self.assertEqual(result['status'], 'failed')
+            run.assert_not_called()
+
+    def test_resume_exact_lookup_and_acl_fail_closed(self):
+        self.recipient_session('default', 'other-profile')
+        self.recipient_session('mail')
+        for target, sid, status in [('mail', 'other-profile', 'failed'), ('mail', 'missing-title', 'failed'), ('local', 'test-recipient', 'blocked')]:
+            result, run = self.call({**self.args, 'target': target, 'mode': 'resume', 'session_id': sid})
+            self.assertEqual(result['status'], status)
+            run.assert_not_called()
+        (self.root / 'profiles/mail/state.db').unlink()
+        result, run = self.call({**self.args, 'mode': 'resume', 'session_id': 'test-recipient'})
+        self.assertEqual(result['status'], 'failed')
+        run.assert_not_called()
+        self.assertFalse((self.root / 'profiles/mail/state.db').exists())
+
+    def test_resume_busy_timeout_and_admission(self):
+        sid = self.recipient_session()
+        args = {**self.args, 'mode': 'resume', 'session_id': sid}
+        for transport, status in [((1, '', 'hermes-refusal-reason: SESSION_NOT_OWNED\n', False), 'target_busy'), ((-9, '', '', True), 'timeout_unknown')]:
+            result, run = self.call(args, transport)
+            self.assertEqual(result['status'], status)
+            self.assertEqual(result['session_id'], sid)
+            run.assert_called_once()
+        with consult._receiver_lock(self.root, 'mail', 'resume', sid):
+            result, run = self.call(args)
+            self.assertEqual(result['status'], 'target_busy')
+            run.assert_not_called()
+            self.recipient_session('mail', 'independent')
+            result, run = self.call({**args, 'session_id': 'independent'})
+            self.assertEqual(result['status'], 'completed')
+        result, _ = self.call(args)
+        self.assertEqual(result['status'], 'completed')
+
+    def test_resume_discovery(self):
+        self.assertIn('resume', consult.ASK_SCHEMA['parameters']['properties']['mode']['enum'])
+        self.assertIn('session_id', consult.ASK_SCHEMA['parameters']['properties'])
+        self.assertIn('resume', json.loads(consult.list_peers(self.domains, {}))['modes'])
 
     def test_alias_default_and_at_id(self):
         for name,canonical in [('@mail','mail'),('hermes','default')]:
@@ -202,9 +273,23 @@ class ConsultTests(unittest.TestCase):
         self.assertTrue(timed_out)
         self.assertNotEqual(code,0)
         child=int(out.strip())
+        # SIGKILL delivery to the grandchild can lag the leader's wait().
+        if hasattr(os, 'pidfd_open'):
+            try:
+                fd = os.pidfd_open(child)
+            except ProcessLookupError:
+                return
+            try:
+                self.assertTrue(select.select([fd], [], [], 5)[0])
+            finally:
+                os.close(fd)
         stat=Path(f'/proc/{child}/stat')
-        if stat.exists():
-            self.assertIn(stat.read_text().rsplit(')',1)[1].split()[0],('Z','X'))
+        try:
+            state = stat.read_text().rsplit(')',1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            pass  # Already reaped before opening or reading procfs.
+        else:
+            self.assertIn(state, ('Z','X'))
 
     def test_stderr_substring_does_not_fake_busy(self):
         result,_=self.call(transport=(1,'','diagnostic quote: hermes-refusal-reason: SESSION_NOT_OWNED suffix\n',False))
