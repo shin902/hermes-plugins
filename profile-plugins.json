@@ -10,7 +10,7 @@
     {
       "profile": "default",
       "plugin": "hermes-activity",
-      "source": "profiles/default/hermes-activity",
+      "source": "hermes-activity",
       "version": "0.2.0"
     },
     {
@@ -22,7 +22,7 @@
     {
       "profile": "default",
       "plugin": "model-providers/opencode-acp",
-      "source": "profiles/default/model-providers/opencode-acp",
+      "source": "model-providers/opencode-acp",
       "version": "1.2.1"
     },
     {
@@ -46,31 +46,31 @@
     {
       "profile": "coding",
       "plugin": "bot-acl",
-      "source": "profiles/coding/bot-acl",
-      "version": "0.4.0"
+      "source": "bot-acl",
+      "version": "0.5.0"
     },
     {
       "profile": "coding",
       "plugin": "hermes-cli",
-      "source": "profiles/coding/hermes-cli",
+      "source": "hermes-cli",
       "version": "1.0.0"
     },
     {
       "profile": "coding",
       "plugin": "host-android",
-      "source": "profiles/coding/host-android",
+      "source": "host-android",
       "version": "1.0.0"
     },
     {
       "profile": "coding",
       "plugin": "host-github",
-      "source": "profiles/coding/host-github",
+      "source": "host-github",
       "version": "1.0.0"
     },
     {
       "profile": "coding",
       "plugin": "host-ops",
-      "source": "profiles/coding/host-ops",
+      "source": "host-ops",
       "version": "1.0.0"
     },
     {
@@ -82,25 +82,25 @@
     {
       "profile": "coding",
       "plugin": "orca-status",
-      "source": "profiles/coding/orca-status",
+      "source": "orca-status",
       "version": "1.0.0"
     },
     {
       "profile": "coding",
       "plugin": "tsc-cleanup",
-      "source": "profiles/coding/tsc-cleanup",
+      "source": "tsc-cleanup",
       "version": "0.1.0"
     },
     {
       "profile": "computer-use",
       "plugin": "bot-acl",
-      "source": "profiles/computer-use/bot-acl",
-      "version": "0.4.0"
+      "source": "bot-acl",
+      "version": "0.5.0"
     },
     {
       "profile": "computer-use",
       "plugin": "orca-status",
-      "source": "profiles/computer-use/orca-status",
+      "source": "orca-status",
       "version": "1.0.0"
     },
     {
@@ -130,49 +130,49 @@
     {
       "profile": "mail",
       "plugin": "mail-monitor",
-      "source": "profiles/mail/mail-monitor",
+      "source": "mail-monitor",
       "version": "1.0.0"
     },
     {
       "profile": "my-dot",
       "plugin": "bot-acl",
-      "source": "profiles/my-dot/bot-acl",
-      "version": "0.4.0"
+      "source": "bot-acl",
+      "version": "0.5.0"
     },
     {
       "profile": "my-dot",
       "plugin": "hermes-activity",
-      "source": "profiles/my-dot/hermes-activity",
+      "source": "hermes-activity",
       "version": "0.2.0"
     },
     {
       "profile": "my-dot",
       "plugin": "orca-status",
-      "source": "profiles/my-dot/orca-status",
+      "source": "orca-status",
       "version": "1.0.0"
     },
     {
       "profile": "my-dot",
       "plugin": "rss-monitor",
-      "source": "profiles/my-dot/rss-monitor",
+      "source": "rss-monitor",
       "version": "3.0.0"
     },
     {
       "profile": "note-writing",
       "plugin": "bot-acl",
-      "source": "profiles/note-writing/bot-acl",
-      "version": "0.4.0"
+      "source": "bot-acl",
+      "version": "0.5.0"
     },
     {
       "profile": "note-writing",
       "plugin": "orca-status",
-      "source": "profiles/note-writing/orca-status",
+      "source": "orca-status",
       "version": "1.0.0"
     },
     {
       "profile": "note-writing",
       "plugin": "rss-monitor",
-      "source": "profiles/note-writing/rss-monitor",
+      "source": "rss-monitor",
       "version": "3.0.0"
     },
     {

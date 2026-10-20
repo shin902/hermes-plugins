@@ -11,12 +11,12 @@ class SetupTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.repo, self.home = root / 'repo', root / 'home'
-        self.src = self.repo / 'profiles' / 'example' / 'demo'
+        self.src = self.repo / 'demo'
         self.src.mkdir(parents=True)
         (self.src / 'plugin.yaml').write_text('name: demo\nversion: 1.2.3\n')
         (self.home / 'plugins').mkdir(parents=True)
         self.target = self.home / 'plugins' / 'demo'
-        self.entry = dict(profile='default', plugin='demo', source='profiles/example/demo', version='1.2.3')
+        self.entry = dict(profile='default', plugin='demo', source='demo', version='1.2.3')
         self.mapping = dict(schema_version=2, mappings=[self.entry])
 
     def run_setup(self, apply=False):
@@ -71,8 +71,26 @@ class SetupTests(unittest.TestCase):
 
     def test_nested_provider(self):
         self.entry['plugin'] = 'model-providers/demo'
+        self.entry['source'] = 'model-providers/demo'
+        destination = self.repo / self.entry['source']
+        destination.parent.mkdir()
+        self.src.rename(destination)
+        self.src = destination
         (self.home / 'plugins/model-providers').mkdir()
         self.assertEqual(self.run_setup(True)['created'], 1)
+
+    def test_profile_specific_source_refused(self):
+        self.entry['source'] = 'profiles/example/demo'
+        with self.assertRaises(ValueError): self.run_setup(True)
+        self.assertFalse(self.target.exists())
+
+    def test_profiles_share_one_source(self):
+        self.mapping['mappings'].append(dict(self.entry, profile='example'))
+        target = self.home / 'profiles/example/plugins/demo'
+        target.parent.mkdir(parents=True)
+        self.assertEqual(self.run_setup(True)['created'], 2)
+        self.assertTrue(self.target.samefile(target))
+        self.assertEqual(self.run_setup()['unchanged'], 2)
 
     def test_rollback(self):
         src2 = self.repo / 'second'; src2.mkdir()

@@ -210,10 +210,3 @@ def batch_acknowledged(state: dict, receipt: Path) -> bool:
                 == [item["id"] for item in expected["items"]])
     except (json.JSONDecodeError, KeyError, TypeError):
         return False
-
-
-def run_monitor(home: Path, job_id: str, url: str) -> None:
-    """Compatibility entry point: prepare only; never fetch or consume legacy state."""
-    from .runtime import prepare
-    print(prepare(home, job_id))
-

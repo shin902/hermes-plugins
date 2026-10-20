@@ -9,8 +9,12 @@ def home():
     return get_hermes_home()
 
 
+def config_dir():
+    return Path(home()) / 'plugin-config/rss-monitor'
+
+
 def settings():
-    directory = Path(__file__).parent
+    directory = config_dir()
     feeds = json.loads((directory / 'feeds.json').read_text(encoding='utf-8'))
     targets = json.loads((directory / 'delivery.json').read_text(encoding='utf-8'))
     if set(feeds) != set(targets):
@@ -28,7 +32,7 @@ def handle(args):
         feeds, _ = settings()
         if args.job_id not in feeds:
             raise ValueError('Unknown RSS job')
-        print(prepare(home(), args.job_id))
+        print(prepare(args.job_id))
     except Exception as exc:
         print(f'RSS monitor failed: {exc}', file=sys.stderr)
         return 1
@@ -45,7 +49,7 @@ def collect_all(args):
     errors = []
     for job_id, url in feeds.items():
         try:
-            result = collect(home(), job_id, url)
+            result = collect(job_id, url)
             if not result['ok']:
                 # A failed feed remains failed in plugin health + HTTP diagnostics, never read.
                 # The collector's task is to perform/record attempts, not deliver articles.
@@ -54,7 +58,7 @@ def collect_all(args):
                 from .runtime import locked, write
                 alert_result = {'status': 'unknown', 'error': 'Notification interrupted'}
                 try:
-                    response = send(home(), targets[job_id],
+                    response = send(targets[job_id],
                         f"⚠ RSS取得が3時間以上継続して失敗しています。job={job_id}\n{result['error']}")
                     if (response.get('success') is not True or not isinstance(response.get('message_id'), str)
                             or not response['message_id'].strip()):
@@ -66,7 +70,7 @@ def collect_all(args):
                 finally:
                     # One ATTEMPT per outage, not guaranteed delivery or an automatic retry.
                     # Uncertain sends are never blindly repeated; native failure lane reports errors.
-                    with locked(home(), job_id) as state_path:
+                    with locked(job_id) as state_path:
                         health_path = state_path.with_name(f'{job_id}-health.json')
                         health = json.loads(health_path.read_text())
                         health['outage']['notification'] = alert_result
@@ -86,7 +90,7 @@ def register(ctx):
             feeds, targets = settings()
             if run is None or run.job_id not in feeds:
                 raise ValueError('rss_publish is limited to configured RSS cron executions')
-            return json.dumps(publish(home(), run.job_id, run.execution_id,
+            return json.dumps(publish(run.job_id, run.execution_id,
                                       params['batch_id'], params['summary'], targets[run.job_id]),
                               ensure_ascii=False)
         except Exception as exc:

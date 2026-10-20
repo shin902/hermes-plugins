@@ -23,22 +23,25 @@ class StateTests(unittest.TestCase):
         self.directory=tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.home=Path(self.directory.name)
+        profile = patch('hermes_constants.get_hermes_home', return_value=self.home)
+        profile.start()
+        self.addCleanup(profile.stop)
         self.path=self.home/'cron/rss-monitor/job.json'
         r.write(self.path,r.initial('feed',[]))
     def pending(self):
         with patch.object(r,'fetch_feed',return_value=[ITEM]):
-            self.assertTrue(r.collect(self.home,'job','feed')['ok'])
-        return json.loads(r.prepare(self.home,'job'))['batch_id']
-    def sender(self,home,target,text):
+            self.assertTrue(r.collect('job','feed')['ok'])
+        return json.loads(r.prepare('job'))['batch_id']
+    def sender(self,target,text):
         return {'success':True,'platform':'discord','chat_id':'123','message_id':'confirmed'}
     def test_no_items_is_stable_and_no_fetch_in_monitor(self):
         with patch.object(r,'fetch_feed',side_effect=AssertionError('must not fetch')):
-            self.assertEqual(r.prepare(self.home,'job'),r.EMPTY_OUTPUT)
-            self.assertEqual(r.prepare(self.home,'job'),r.EMPTY_OUTPUT)
+            self.assertEqual(r.prepare('job'),r.EMPTY_OUTPUT)
+            self.assertEqual(r.prepare('job'),r.EMPTY_OUTPUT)
     def test_retry_nonce_preserves_batch_after_pre_agent_snapshot(self):
         batch=self.pending()
         first=r.read(self.path)['output']
-        second=r.prepare(self.home,'job')
+        second=r.prepare('job')
         self.assertNotEqual(first,second)
         self.assertEqual(json.loads(second)['batch_id'],batch)
         self.assertEqual(json.loads(second)['items'],[ITEM])
@@ -50,24 +53,24 @@ class StateTests(unittest.TestCase):
             sends.append(args)
             self.assertEqual(r.read(self.path)['current']['status'],'sending')
             return self.sender(*args)
-        result=r.publish(self.home,'job','execution',batch,TEXT,TARGET,sender=send)
+        result=r.publish('job','execution',batch,TEXT,TARGET,sender=send)
         self.assertTrue(result['success'])
         self.assertIsNone(r.read(self.path)['current'])
-        self.assertEqual(r.prepare(self.home,'job'),output)
-        self.assertTrue(r.publish(self.home,'job','execution',batch,TEXT,TARGET,sender=send)['already_delivered'])
+        self.assertEqual(r.prepare('job'),output)
+        self.assertTrue(r.publish('job','execution',batch,TEXT,TARGET,sender=send)['already_delivered'])
         self.assertEqual(len(sends),1)
     def test_ambiguous_failure_never_resends(self):
         batch=self.pending()
         with self.assertRaises(TimeoutError):
-            r.publish(self.home,'job','execution',batch,TEXT,TARGET,sender=lambda *args: (_ for _ in ()).throw(TimeoutError()))
+            r.publish('job','execution',batch,TEXT,TARGET,sender=lambda *args: (_ for _ in ()).throw(TimeoutError()))
         self.assertEqual(r.read(self.path)['current']['status'],'unknown')
-        with self.assertRaises(ValueError): r.prepare(self.home,'job')
-        with self.assertRaises(ValueError): r.publish(self.home,'job','execution',batch,TEXT,TARGET,sender=self.sender)
+        with self.assertRaises(ValueError): r.prepare('job')
+        with self.assertRaises(ValueError): r.publish('job','execution',batch,TEXT,TARGET,sender=self.sender)
     def test_partial_chunks_preserve_receipts(self):
         batch=self.pending()
-        responses=iter([self.sender(None,None,None),{'success':False,'error':'failed'}])
+        responses=iter([self.sender(None,None),{'success':False,'error':'failed'}])
         with self.assertRaises(RuntimeError):
-            r.publish(self.home,'job','execution',batch,TEXT+'a'*3500,TARGET,sender=lambda *args:next(responses))
+            r.publish('job','execution',batch,TEXT+'a'*3500,TARGET,sender=lambda *args:next(responses))
         current=r.read(self.path)['current']
         self.assertEqual(current['status'],'unknown')
         self.assertEqual(current['message_ids'],['confirmed'])
@@ -77,30 +80,30 @@ class StateTests(unittest.TestCase):
                 r.write(self.path,r.initial('feed',[]))
                 batch=self.pending()
                 with self.assertRaises(RuntimeError):
-                    r.publish(self.home,'job','execution',batch,TEXT,TARGET,sender=lambda *args:response)
+                    r.publish('job','execution',batch,TEXT,TARGET,sender=lambda *args:response)
                 self.assertIsNotNone(r.read(self.path)['current'])
     def test_bad_summary_has_no_transport_side_effect(self):
         batch=self.pending()
         for text in ['missing original URL but long enough summary content',TEXT+' MEDIA:/secret',TEXT+' @everyone']:
             with self.assertRaises(ValueError):
-                r.publish(self.home,'job','execution',batch,text,TARGET,sender=lambda *args: self.fail('must not send'))
+                r.publish('job','execution',batch,text,TARGET,sender=lambda *args: self.fail('must not send'))
         self.assertEqual(r.read(self.path)['current']['status'],'ready')
     def test_collection_failure_preserves_article_state_and_outage_policy(self):
         self.pending()
         before=self.path.read_bytes()
         with patch.object(r,'fetch_feed',side_effect=r.TransientFetchError('HTTP 404')) as fetch:
-            self.assertFalse(r.collect(self.home,'job','feed',now=100)['alert'])
-            self.assertTrue(r.collect(self.home,'job','feed',now=10900)['alert'])
-            self.assertFalse(r.collect(self.home,'job','feed',now=20000)['alert'])
+            self.assertFalse(r.collect('job','feed',now=100)['alert'])
+            self.assertTrue(r.collect('job','feed',now=10900)['alert'])
+            self.assertFalse(r.collect('job','feed',now=20000)['alert'])
             self.assertEqual(fetch.call_count,3)
         self.assertEqual(before,self.path.read_bytes())
-        with patch.object(r,'fetch_feed',return_value=[ITEM]):r.collect(self.home,'job','feed')
+        with patch.object(r,'fetch_feed',return_value=[ITEM]):r.collect('job','feed')
         self.assertEqual(json.loads(self.path.with_name('job-health.json').read_text())['status'],'ok')
     def test_native_send_public_cli_and_profile_scope(self):
         import subprocess
-        good=subprocess.CompletedProcess([],0,json.dumps(self.sender(None,None,None)),'')
+        good=subprocess.CompletedProcess([],0,json.dumps(self.sender(None,None)),'')
         with patch.object(r.subprocess,'run',return_value=good) as run:
-            self.assertTrue(r.send(self.home,TARGET,TEXT)['success'])
+            self.assertTrue(r.send(TARGET,TEXT)['success'])
         self.assertEqual(run.call_args.args[0],['hermes','send','--to',TARGET,'--json','--file','-'])
         self.assertEqual(run.call_args.kwargs['env']['HERMES_HOME'],str(self.home))
     def test_tool_uses_current_execution_not_user_target(self):
@@ -124,10 +127,10 @@ class StateTests(unittest.TestCase):
         state=r.read(self.path)
         state['pending']=[{'id':'new','url':1}]
         r.write(self.path,state)
-        with self.assertRaises(ValueError):r.prepare(self.home,'job')
+        with self.assertRaises(ValueError):r.prepare('job')
         r.write(self.path,r.initial('feed',[]))
         batch=self.pending()
-        with self.assertRaises(RuntimeError):r.publish(self.home,'job','e',batch,TEXT,TARGET,sender=lambda *a:{'success':True,'platform':'discord','message_id':True})
+        with self.assertRaises(RuntimeError):r.publish('job','e',batch,TEXT,TARGET,sender=lambda *a:{'success':True,'platform':'discord','message_id':True})
         self.assertEqual(r.read(self.path)['current']['status'],'unknown')
     def test_failed_notification_is_recorded_and_surfaces_native_failure(self):
         r.write(self.path.with_name('job-health.json'),{'status':'fetch_failed','outage':{'first_failure_at':1,'failures':4,'alert_attempted':False}})
@@ -136,10 +139,12 @@ class StateTests(unittest.TestCase):
         health=json.loads(self.path.with_name('job-health.json').read_text())
         self.assertTrue(health['outage']['alert_attempted'])
         self.assertEqual(health['outage']['notification']['status'],'unknown')
-    def test_monitor_compatibility_entry_never_fetches(self):
+    def test_monitor_cli_prepares_current_profile_without_fetching(self):
+        from types import SimpleNamespace
         from rss_v3 import monitor
-        with patch.object(r,'prepare',return_value=r.EMPTY_OUTPUT),patch.object(monitor,'fetch_feed',side_effect=AssertionError('must not fetch')),patch('sys.stdout',new_callable=io.StringIO) as output:
-            monitor.run_monitor(self.home,'job','feed')
+        with patch.object(pkg,'settings',return_value=({'job':'feed'},{'job':TARGET})),patch.object(r,'prepare',return_value=r.EMPTY_OUTPUT) as prepare,patch.object(monitor,'fetch_feed',side_effect=AssertionError('must not fetch')),patch('sys.stdout',new_callable=io.StringIO) as output:
+            self.assertEqual(pkg.handle(SimpleNamespace(job_id='job')), 0)
+            prepare.assert_called_once_with('job')
             self.assertEqual(output.getvalue().strip(),r.EMPTY_OUTPUT)
     def test_diagnostics_remove_credentials_and_error_body(self):
         from rss_v3 import monitor
@@ -150,6 +155,92 @@ class StateTests(unittest.TestCase):
         self.assertNotIn('password',data['source_url'])
         self.assertNotIn('secret',data['source_url'])
         self.assertIn('channel_id=public',data['source_url'])
+    def test_profile_configs_and_runtime_state_are_isolated(self):
+        homes = {name: self.home / name for name in ('my-dot', 'note-writing')}
+        for name, profile_home in homes.items():
+            config = profile_home / 'plugin-config/rss-monitor'
+            config.mkdir(parents=True)
+            (config / 'feeds.json').write_text(json.dumps({name: f'https://{name}.example/feed'}))
+            (config / 'delivery.json').write_text(json.dumps({name: f'discord:{1 if name == "my-dot" else 2}'}))
+            (config / 'policies.json').write_text(json.dumps({name: {
+                'exclude_youtube_shorts': True}}))
+            path = profile_home / 'cron/rss-monitor' / f'{name}.json'
+            state = r.initial(f'https://{name}.example/feed', [])
+            state['pending'] = [dict(ITEM, id=f'{name}-{n}', url=f'https://example.com/{name}/{n}')
+                                for n in range(2)]
+            r.write(path, state)
+
+        for name, profile_home in homes.items():
+            with patch('hermes_constants.get_hermes_home', return_value=profile_home):
+                feeds, targets = pkg.settings()
+                self.assertEqual(set(feeds), {name})
+                self.assertEqual(set(targets), {name})
+                self.assertTrue(r.excludes_shorts(name))
+                self.assertFalse(r.excludes_shorts('other'))
+                output = json.loads(r.prepare(name))
+                self.assertEqual(len(output['items']), 1)
+                self.assertTrue((profile_home / 'cron/rss-monitor' / f'{name}.json').exists())
+                self.assertFalse((homes['note-writing' if name == 'my-dot' else 'my-dot']
+                                  / 'cron/rss-monitor' / f'{name}.json').exists())
+
+    def test_one_article_at_a_time_preserves_order_and_retries(self):
+        items = [dict(ITEM, id=str(n), url=f'https://example.com/{n}') for n in range(6)]
+        state = r.read(self.path)
+        state['pending'] = items.copy()
+        r.write(self.path, state)
+        for index, item in enumerate(items):
+            output = json.loads(r.prepare('job'))
+            self.assertEqual(output['items'], [item])
+            self.assertEqual(json.loads(r.prepare('job'))['batch_id'], output['batch_id'])
+            self.assertEqual(r.read(self.path)['pending'], items[index + 1:])
+            r.publish('job', 'execution', output['batch_id'],
+                      'Verified article summary and original source: ' + item['url'],
+                      TARGET, sender=self.sender)
+
+    def test_current_profile_supplies_both_state_and_shorts_policy(self):
+        from inspect import signature
+        from rss_v3 import monitor
+        self.assertFalse(hasattr(monitor, 'run_monitor'))
+        for function in (r.locked, r.collect, r.prepare, r.publish, r.send):
+            self.assertNotIn('home', signature(function).parameters)
+        short = dict(ITEM, url='https://www.youtube.com/shorts/new')
+        for exclude in (True, False):
+            profile_home = self.home / str(exclude)
+            config = profile_home / 'plugin-config/rss-monitor'
+            config.mkdir(parents=True)
+            (config / 'policies.json').write_text(json.dumps({
+                'job': {'exclude_youtube_shorts': exclude}}))
+            path = profile_home / 'cron/rss-monitor/job.json'
+            state = r.initial('feed', [])
+            state['pending'] = [short]
+            r.write(path, state)
+            with patch('hermes_constants.get_hermes_home', return_value=profile_home):
+                output = json.loads(r.prepare('job'))
+                self.assertEqual(output['items'], [] if exclude else [short])
+                if not exclude:
+                    self.assertTrue(r.publish('job', 'execution', output['batch_id'],
+                        'Verified summary and original source: ' + short['url'],
+                        TARGET, sender=self.sender)['success'])
+            self.assertEqual(r.read(path).get('policy_exclusions', {}).get('new') is not None, exclude)
+
+    def test_legacy_ready_batch_is_split_without_losing_articles(self):
+        items = [dict(ITEM, id=str(n), url=f'https://example.com/{n}') for n in range(3)]
+        state = r.read(self.path)
+        old_id = 'a' * 32
+        state['current'] = {'batch_id': old_id, 'status': 'ready', 'items': items[:2]}
+        state['pending'] = items[2:]
+        r.write(self.path, state)
+        with self.assertRaises(ValueError):
+            r.publish('job', 'execution', old_id, TEXT, TARGET,
+                      sender=lambda *args: self.fail('must not send multiple articles'))
+        output = json.loads(r.prepare('job'))
+        self.assertEqual(output['items'], items[:1])
+        self.assertNotEqual(output['batch_id'], old_id)
+        self.assertEqual(r.read(self.path)['pending'], items[1:])
+        with self.assertRaises(ValueError):
+            r.publish('job', 'execution', old_id, TEXT, TARGET,
+                      sender=lambda *args: self.fail('must not send stale batch'))
+
     def test_utf16_chunks_fit_discord(self):
         text='😀'*4000
         parts=r.chunks(text)

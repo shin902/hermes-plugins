@@ -13,19 +13,25 @@ entries. Existing correct links remain unchanged. Missing links are relative;
 existing real directories or divergent links are refused. Validation precedes all
 writes and partial link creation rolls back. Output is aggregate-only.
 
-Sources are profile-specific unless an already-correct shared link existed.
-RSS feeds.json, policies.json and delivery.json remain with their own profile
-source, untracked. This preserves __file__-relative lookup and delivery isolation.
+Each plugin has exactly one repository source: its plugin path at the root
+(including model-providers/opencode-acp). Every profile maps to that same path;
+the setup script rejects profile-specific source paths to prevent new forks.
+RSS feeds.json, policies.json and delivery.json live outside the plugin symlink,
+under each profile's HERMES_HOME/plugin-config/rss-monitor/, untracked.
+Durable RSS state remains under that profile's cron/rss-monitor/.
 Host audit directories remain beside their source and writable at the same
 __file__.resolve()-relative location. Other runtime/generated files stay intact,
 but are excluded from Git. A checkout alone intentionally does not reconstruct
 private runtime configuration: restore that profile's files from a local backup
 before enabling services on a new machine.
 
-Migration used the newest semantic version already installed in active profiles.
-Equal-version local variations were retained per profile. Existing custom provider
-code was preserved. hermes-activity is ordinary source, not a nested Git repository.
-No upstream fetches, package installs, commits, pushes or Hermes restarts were done.
+The original import retained per-profile variations. Source unification now uses
+the root bot-acl implementation (including unlimited consultation time and resume)
+for all mapped profiles. Identical Orca and Activity copies were deduplicated;
+single-profile plugins and the custom provider were relocated without code changes.
+RSS processes exactly one article per run, with profile-local Shorts exclusion policies.
+hermes-activity is ordinary source, not a nested Git repository.
+Unification does not change activation settings or restart Hermes.
 
 Full pre-cutover hash/mode-verified snapshots and retired originals are outside
 this repository under the Hermes home, in hermes-plugin-migration-* directories.
