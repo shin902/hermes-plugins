@@ -15,7 +15,8 @@ from test_acl import acl
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
-consult = sys.modules[acl.__name__ + '.consult']
+consult = sys.modules[acl.__name__ + '.ask_bot']
+peers = sys.modules[acl.__name__ + '.list_bot_peers']
 
 
 class ConsultTests(unittest.TestCase):
@@ -136,7 +137,7 @@ class ConsultTests(unittest.TestCase):
     def test_resume_discovery(self):
         self.assertIn('resume', consult.ASK_SCHEMA['parameters']['properties']['mode']['enum'])
         self.assertIn('session_id', consult.ASK_SCHEMA['parameters']['properties'])
-        self.assertIn('resume', json.loads(consult.list_peers(self.domains, {}))['modes'])
+        self.assertIn('resume', json.loads(peers.list_peers(self.domains, {}))['modes'])
 
     def test_alias_default_and_at_id(self):
         for name,canonical in [('@mail','mail'),('hermes','default')]:
@@ -160,11 +161,11 @@ class ConsultTests(unittest.TestCase):
         result,run=self.call()
         self.assertEqual(result['status'],'blocked')
         run.assert_not_called()
-        listing=json.loads(consult.list_peers(self.domains,{}))
+        listing=json.loads(peers.list_peers(self.domains,{}))
         self.assertNotIn('mail',listing['peers'])
 
     def test_listing_same_group_only(self):
-        listing=json.loads(consult.list_peers(self.domains,{}))
+        listing=json.loads(peers.list_peers(self.domains,{}))
         self.assertEqual(listing['peers'],['default','mail'])
         self.assertEqual(listing['source'],'coding')
 
@@ -252,10 +253,12 @@ class ConsultTests(unittest.TestCase):
 
     def test_standard_registration_prompt_and_imports(self):
         manager=PluginManager(str(self.root))
-        consult.register_consult(PluginContext(PluginManifest(name='bot-acl'),manager),self.domains)
+        context=PluginContext(PluginManifest(name='bot-acl'),manager)
+        consult.register(context,self.domains)
+        consult.register_prompt(context)
         sections=manager.render_system_prompt_sections({'session_id':'ordinary','title':'ordinary'})
         self.assertTrue(sections)
-        tree=ast.parse(Path(__file__).with_name('consult.py').read_text())
+        tree=ast.parse(Path(__file__).with_name('ask_bot.py').read_text())
         core=[(node.module,item.name) for node in ast.walk(tree) if isinstance(node,ast.ImportFrom) and node.module and node.module.startswith(('hermes','tools','agent')) for item in node.names]
         self.assertEqual(core,[('hermes_constants','get_hermes_home')])
 

@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import consult
+from . import ask_bot
 from .policy import check
 
 SCHEMA = {
@@ -130,7 +130,7 @@ class Child:
                 return
             self.closed = True
             self.timer.cancel()
-        consult._stop_group(self.proc)
+        ask_bot._stop_group(self.proc)
         for stream in (self.proc.stdin, self.proc.stdout):
             try:
                 stream.close()
@@ -141,7 +141,7 @@ class Child:
 def _start(task, target, text, timeout):
     child = None
     try:
-        _, root = consult.identity()
+        _, root = ask_bot.identity()
         home = root if target == "default" else root / "profiles" / target
         env = dict(os.environ, HERMES_HOME=str(home), BOT_ACL_CONSULT_CHILD="1")
         for name in ("HERMES_TUI_ATTACH_URL", "HERMES_TUI_SIDECAR_URL", "HERMES_PROFILE", "HERMES_SESSION_ID"):
@@ -182,7 +182,7 @@ def _owner(kwargs):
     sid = kwargs.get("session_id")
     if not isinstance(sid, str) or not sid:
         raise ValueError("verified parent session_id is required from the tool runtime")
-    return (str(consult.get_hermes_home()), sid)
+    return (str(ask_bot.get_hermes_home()), sid)
 
 
 def _snapshot(task):
@@ -198,7 +198,7 @@ def _snapshot(task):
 
 def handle(domains, args, **kwargs):
     try:
-        if os.environ.get(consult.DEPTH_ENV) == "1":
+        if os.environ.get(ask_bot.DEPTH_ENV) == "1":
             raise ValueError("nested child tasks are disabled")
         owner = _owner(kwargs)
         action = args.get("action")
@@ -295,7 +295,7 @@ def shutdown():
 atexit.register(shutdown)
 
 
-def register_tasks(ctx, domains):
-    ctx.register_tool("bot_task", consult.TOOLSET, SCHEMA,
-        lambda args, **kw: handle(domains, args, **kw), check_fn=consult.available,
+def register(ctx, domains):
+    ctx.register_tool("bot_task", ask_bot.TOOLSET, SCHEMA,
+        lambda args, **kw: handle(domains, args, **kw), check_fn=ask_bot.available,
         description="Manage parent-owned bot tasks", emoji="🧩")

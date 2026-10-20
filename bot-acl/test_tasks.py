@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch, Mock
 from test_acl import acl
 
-tasks = sys.modules[acl.__name__ + '.tasks']
+tasks = sys.modules[acl.__name__ + '.bot_task']
 
 class TaskTests(unittest.TestCase):
     def setUp(self):
@@ -17,9 +17,9 @@ class TaskTests(unittest.TestCase):
         self.child = Mock(closed=False, sid='child-only', reply='result', deadline=time.monotonic()+30, outcome='completed')
         self.child.done = threading.Event()
         tasks._TASKS['t'] = {'id':'t', 'owner':('/parent', 'parent'), 'target':'coding', 'child':self.child, 'status':'running', 'lock':threading.RLock()}
-        self.home = patch.object(tasks.consult, 'get_hermes_home', return_value='/parent')
+        self.home = patch.object(tasks.ask_bot, 'get_hermes_home', return_value='/parent')
         self.acl = patch.object(tasks, 'check', return_value=None)
-        self.depth = patch.dict(tasks.os.environ, {tasks.consult.DEPTH_ENV:'0'})
+        self.depth = patch.dict(tasks.os.environ, {tasks.ask_bot.DEPTH_ENV:'0'})
         for p in (self.home,self.acl,self.depth):
             p.start(); self.addCleanup(p.stop)
         ctx = Mock()
@@ -69,10 +69,10 @@ class TaskTests(unittest.TestCase):
             self.child.rpc.assert_not_called()
 
     def test_nested_tasks_blocked(self):
-        with patch.dict(tasks.os.environ,{tasks.consult.DEPTH_ENV:'1'}):
+        with patch.dict(tasks.os.environ,{tasks.ask_bot.DEPTH_ENV:'1'}):
             self.assertEqual(self.call('list')['status'],'failed')
 
     def test_registration(self):
         ctx=Mock()
-        tasks.register_tasks(ctx,{})
+        tasks.register(ctx,{})
         self.assertEqual(ctx.register_tool.call_args.args[:3],('bot_task','bot_consult',tasks.SCHEMA))

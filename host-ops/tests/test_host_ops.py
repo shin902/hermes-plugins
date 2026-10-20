@@ -9,8 +9,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import __init__ as plugin
+import importlib.util
+
+_PLUGIN = Path(__file__).resolve().parents[1] / "host_ops.py"
+_spec = importlib.util.spec_from_file_location("host_ops_plugin", _PLUGIN)
+plugin = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(plugin)
 
 
 class HostOpsTests(unittest.TestCase):

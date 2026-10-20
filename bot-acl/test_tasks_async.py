@@ -40,7 +40,7 @@ class AsyncTests(TaskTests):
     def test_schema_handler_isolation(self):
         import jsonschema
         ctx = Mock()
-        tasks.register_tasks(ctx, {})
+        tasks.register(ctx, {})
         callback = ctx.register_tool.call_args.args[3]
         payload = {'action':'list'}
         jsonschema.validate(payload, tasks.SCHEMA['parameters'])

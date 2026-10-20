@@ -5,6 +5,7 @@ Python 3.9+ standard library only; no network, plugin imports, config changes or
     python3 setup_profiles.py --home /home/shi/.hermes --dry-run
     python3 setup_profiles.py --home /home/shi/.hermes --apply
     python3 test_setup_profiles.py -v
+    hermes --run-module unittest discover -s . -p 'test_tool_modules.py' -v
 
 Dry-run is the default. --home overrides HERMES_HOME; --repo and --mapping are configurable.
 The schema_version 2 manifest explicitly maps each profile/plugin install to a

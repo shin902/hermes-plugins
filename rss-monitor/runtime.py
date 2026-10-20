@@ -12,7 +12,7 @@ import subprocess
 import time
 import uuid
 
-from . import config_dir, home as current_home
+from .settings import config_dir, home as current_home
 from .monitor import EMPTY_OUTPUT, MAX_OUTPUT_CHARS, TransientFetchError, fetch_feed
 
 

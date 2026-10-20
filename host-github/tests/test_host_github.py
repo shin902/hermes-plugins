@@ -7,7 +7,7 @@ from unittest.mock import patch
 import importlib.util
 from pathlib import Path
 
-_spec = importlib.util.spec_from_file_location("host_github", Path(__file__).parents[1] / "__init__.py")
+_spec = importlib.util.spec_from_file_location("host_github", Path(__file__).parents[1] / "host_github.py")
 hg = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hg)
 
