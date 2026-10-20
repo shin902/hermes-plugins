@@ -29,7 +29,7 @@ The original import retained per-profile variations. Source unification now uses
 the root bot-acl implementation (including unlimited consultation time and resume)
 for all mapped profiles. Identical Orca and Activity copies were deduplicated;
 single-profile plugins and the custom provider were relocated without code changes.
-RSS retains both one-article and six-article batching through per-job policies.
+RSS processes exactly one article per run, with profile-local Shorts exclusion policies.
 hermes-activity is ordinary source, not a nested Git repository.
 Unification does not change activation settings or restart Hermes.
 

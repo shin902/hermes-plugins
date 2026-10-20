@@ -21,7 +21,8 @@ No changes to Hermes core; no monkey patches; no added daemon.
 
 Link the canonical plugin into `$HERMES_HOME/plugins/rss-monitor/`. Configuration lives outside that shared source link, in `$HERMES_HOME/plugin-config/rss-monitor/`: `feeds.json` (job ID to original URL), `delivery.json` (same job IDs to exact `discord:<channel>:<thread>` target), and optional `policies.json`. `get_hermes_home()` scopes both configuration and durable state; subprocess `HERMES_HOME` is explicitly pinned. Move existing per-profile configs into that profile's configuration directory before switching deployments; never combine them. Enable only in the intended profile, using `hermes plugins enable rss-monitor`.
 
-Each job's optional policy `batch_limit` accepts an integer 1–6. Configured jobs default to one article; the migrated my-dot and note-writing policies explicitly retain their former six-article batches. Shorts exclusion and batch size are independent policies.
+Every job processes exactly one article per run. Remaining articles stay pending;
+retries retain the same article until delivery is confirmed. Batch size is not configurable.
 
 Do not let the model edit state or split send and read operations. Generic send_message tools are not an alternative to the dedicated publish tool. Keep standard cron automatic delivery local.
 

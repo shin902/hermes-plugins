@@ -158,7 +158,7 @@ class StateTests(unittest.TestCase):
             (config / 'feeds.json').write_text(json.dumps({name: f'https://{name}.example/feed'}))
             (config / 'delivery.json').write_text(json.dumps({name: f'discord:{1 if name == "my-dot" else 2}'}))
             (config / 'policies.json').write_text(json.dumps({name: {
-                'exclude_youtube_shorts': True, 'batch_limit': 1 if name == 'my-dot' else 6}}))
+                'exclude_youtube_shorts': True}}))
             path = profile_home / 'cron/rss-monitor' / f'{name}.json'
             state = r.initial(f'https://{name}.example/feed', [])
             state['pending'] = [dict(ITEM, id=f'{name}-{n}', url=f'https://example.com/{name}/{n}')
@@ -173,23 +173,42 @@ class StateTests(unittest.TestCase):
                 self.assertTrue(r.excludes_shorts(name))
                 self.assertFalse(r.excludes_shorts('other'))
                 output = json.loads(r.prepare(profile_home, name))
-                self.assertEqual(len(output['items']), 1 if name == 'my-dot' else 2)
+                self.assertEqual(len(output['items']), 1)
                 self.assertTrue((profile_home / 'cron/rss-monitor' / f'{name}.json').exists())
                 self.assertFalse((homes['note-writing' if name == 'my-dot' else 'my-dot']
                                   / 'cron/rss-monitor' / f'{name}.json').exists())
 
-    def test_invalid_batch_limit_preserves_pending(self):
-        config = self.home / 'plugin-config/rss-monitor'
-        config.mkdir(parents=True)
-        path = self.home / 'cron/rss-monitor/job.json'
-        state = r.initial('https://example.com/feed', [])
-        state['pending'] = [ITEM]
-        r.write(path, state)
-        for limit in (0, 7, True, '6'):
-            (config / 'policies.json').write_text(json.dumps({'job': {'batch_limit': limit}}))
-            with patch.object(pkg, 'home', return_value=self.home):
-                with self.assertRaises(ValueError): r.prepare(self.home, 'job')
-            self.assertEqual(r.read(path)['pending'], [ITEM])
+    def test_one_article_at_a_time_preserves_order_and_retries(self):
+        items = [dict(ITEM, id=str(n), url=f'https://example.com/{n}') for n in range(6)]
+        state = r.read(self.path)
+        state['pending'] = items.copy()
+        r.write(self.path, state)
+        for index, item in enumerate(items):
+            output = json.loads(r.prepare(self.home, 'job'))
+            self.assertEqual(output['items'], [item])
+            self.assertEqual(json.loads(r.prepare(self.home, 'job'))['batch_id'], output['batch_id'])
+            self.assertEqual(r.read(self.path)['pending'], items[index + 1:])
+            r.publish(self.home, 'job', 'execution', output['batch_id'],
+                      'Verified article summary and original source: ' + item['url'],
+                      TARGET, sender=self.sender)
+
+    def test_legacy_ready_batch_is_split_without_losing_articles(self):
+        items = [dict(ITEM, id=str(n), url=f'https://example.com/{n}') for n in range(3)]
+        state = r.read(self.path)
+        old_id = 'a' * 32
+        state['current'] = {'batch_id': old_id, 'status': 'ready', 'items': items[:2]}
+        state['pending'] = items[2:]
+        r.write(self.path, state)
+        with self.assertRaises(ValueError):
+            r.publish(self.home, 'job', 'execution', old_id, TEXT, TARGET,
+                      sender=lambda *args: self.fail('must not send multiple articles'))
+        output = json.loads(r.prepare(self.home, 'job'))
+        self.assertEqual(output['items'], items[:1])
+        self.assertNotEqual(output['batch_id'], old_id)
+        self.assertEqual(r.read(self.path)['pending'], items[1:])
+        with self.assertRaises(ValueError):
+            r.publish(self.home, 'job', 'execution', old_id, TEXT, TARGET,
+                      sender=lambda *args: self.fail('must not send stale batch'))
 
     def test_utf16_chunks_fit_discord(self):
         text='😀'*4000

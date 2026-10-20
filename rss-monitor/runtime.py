@@ -168,23 +168,14 @@ def prepare(home: Path, job_id: str) -> str:
         current = state['current']
         if current and current['status'] != 'ready':
             raise ValueError('RSS delivery unknown/partially sent; batch retained; manual reconciliation required')
+        if current and len(current['items']) > 1:
+            state['pending'] = current['items'] + state['pending']
+            state['current'] = current = None
         if not current and state['pending']:
-            batch = []
-            feeds_path = config_dir() / 'feeds.json'
-            feeds = json.loads(feeds_path.read_text(encoding='utf-8')) if feeds_path.exists() else {}
-            batch_limit = 1 if job_id in feeds else 6
-            policies_path = config_dir() / 'policies.json'
-            policies = json.loads(policies_path.read_text(encoding='utf-8')) if policies_path.exists() else {}
-            batch_limit = policies.get(job_id, {}).get('batch_limit', batch_limit)
-            if type(batch_limit) is not int or not 1 <= batch_limit <= 6:
-                raise ValueError('RSS batch_limit must be an integer between 1 and 6')
-            while state['pending'] and len(batch) < batch_limit:
-                candidate = batch + [state['pending'][0]]
-                if len(json.dumps({'items': candidate}, ensure_ascii=False)) > MAX_OUTPUT_CHARS - 300:
-                    if not batch:
-                        raise ValueError('Article exceeds RSS context limit')
-                    break
-                batch.append(state['pending'].pop(0))
+            batch = state['pending'][:1]
+            if len(json.dumps({'items': batch}, ensure_ascii=False)) > MAX_OUTPUT_CHARS - 300:
+                raise ValueError('Article exceeds RSS context limit')
+            state['pending'].pop(0)
             current = {'batch_id': uuid.uuid4().hex, 'status': 'ready', 'items': batch}
             state['current'] = current
         if current:
@@ -239,7 +230,8 @@ def publish(home: Path, job_id: str, execution_id: str, batch_id: str, text: str
         if last and last['batch_id'] == batch_id:
             return {'success': True, 'already_delivered': True, 'message_ids': last['message_ids']}
         current = state['current']
-        if not current or current['batch_id'] != batch_id or current['status'] != 'ready':
+        if (not current or current['batch_id'] != batch_id or current['status'] != 'ready'
+                or len(current['items']) != 1):
             raise ValueError('Batch not ready or wrong batch ID; refusing to resend')
         if excludes_shorts(job_id) and any(is_short(item) for item in current['items']):
             raise ValueError('YouTube Shorts publication is disabled for this job')
