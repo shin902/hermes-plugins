@@ -6,7 +6,7 @@ import sys
 import types
 import unittest
 from unittest.mock import Mock, patch
-spec = importlib.util.spec_from_file_location('admin_guard', Path(__file__).with_name('__init__.py'))
+spec = importlib.util.spec_from_file_location('admin_guard', Path(__file__).with_name('hermes_cli.py'))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 BLOCKED = [[], ['chat'], ['chat', '-q', ''], ['chat', '--query='],

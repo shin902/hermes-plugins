@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-_spec = importlib.util.spec_from_file_location("host_transfer", Path(__file__).parents[1] / "__init__.py")
+_spec = importlib.util.spec_from_file_location("host_transfer", Path(__file__).parents[1] / "host_transfer.py")
 ht = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ht)
 

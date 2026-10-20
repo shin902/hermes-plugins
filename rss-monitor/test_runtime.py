@@ -13,6 +13,7 @@ pkg=importlib.util.module_from_spec(spec)
 sys.modules['rss_v3']=pkg
 spec.loader.exec_module(pkg)
 from rss_v3 import runtime as r
+from rss_v3 import cli, rss_publish, settings as rss_settings
 
 ITEM={'id':'new','url':'https://example.com/new','title':'New','published':'today','description':'Actual fixture'}
 TARGET='discord:123:456'
@@ -114,7 +115,7 @@ class StateTests(unittest.TestCase):
             def register_tool(self,**kwargs): self.handler=kwargs['handler']
             def register_cli_command(self,*args): pass
         ctx=Context()
-        with patch.object(pkg,'settings',return_value=({'job':'feed'},{'job':TARGET})), patch.object(pkg,'home',return_value=self.home), patch.object(r,'publish',return_value={'success':True}) as publish:
+        with patch.object(rss_publish,'settings',return_value=({'job':'feed'},{'job':TARGET})), patch.object(r,'publish',return_value={'success':True}) as publish:
             pkg.register(ctx)
             self.assertFalse(json.loads(ctx.handler({'batch_id':'any','summary':TEXT}))['success'])
             ctx.run=SimpleNamespace(job_id='other',execution_id='e')
@@ -134,16 +135,16 @@ class StateTests(unittest.TestCase):
         self.assertEqual(r.read(self.path)['current']['status'],'unknown')
     def test_failed_notification_is_recorded_and_surfaces_native_failure(self):
         r.write(self.path.with_name('job-health.json'),{'status':'fetch_failed','outage':{'first_failure_at':1,'failures':4,'alert_attempted':False}})
-        with patch.object(pkg,'settings',return_value=({'job':'feed'},{'job':TARGET})), patch.object(pkg,'home',return_value=self.home), patch.object(r,'fetch_feed',side_effect=r.TransientFetchError('HTTP 404')), patch.object(r,'send',side_effect=TimeoutError('Unknown transport')):
-            self.assertEqual(pkg.collect_all(None),1)
+        with patch.object(cli,'settings',return_value=({'job':'feed'},{'job':TARGET})), patch.object(r,'fetch_feed',side_effect=r.TransientFetchError('HTTP 404')), patch.object(r,'send',side_effect=TimeoutError('Unknown transport')):
+            self.assertEqual(cli.collect_all(None),1)
         health=json.loads(self.path.with_name('job-health.json').read_text())
         self.assertTrue(health['outage']['alert_attempted'])
         self.assertEqual(health['outage']['notification']['status'],'unknown')
     def test_monitor_cli_prepares_current_profile_without_fetching(self):
         from types import SimpleNamespace
         from rss_v3 import monitor
-        with patch.object(pkg,'settings',return_value=({'job':'feed'},{'job':TARGET})),patch.object(r,'prepare',return_value=r.EMPTY_OUTPUT) as prepare,patch.object(monitor,'fetch_feed',side_effect=AssertionError('must not fetch')),patch('sys.stdout',new_callable=io.StringIO) as output:
-            self.assertEqual(pkg.handle(SimpleNamespace(job_id='job')), 0)
+        with patch.object(cli,'settings',return_value=({'job':'feed'},{'job':TARGET})),patch.object(r,'prepare',return_value=r.EMPTY_OUTPUT) as prepare,patch.object(monitor,'fetch_feed',side_effect=AssertionError('must not fetch')),patch('sys.stdout',new_callable=io.StringIO) as output:
+            self.assertEqual(cli.handle(SimpleNamespace(job_id='job')), 0)
             prepare.assert_called_once_with('job')
             self.assertEqual(output.getvalue().strip(),r.EMPTY_OUTPUT)
     def test_diagnostics_remove_credentials_and_error_body(self):
@@ -172,7 +173,7 @@ class StateTests(unittest.TestCase):
 
         for name, profile_home in homes.items():
             with patch('hermes_constants.get_hermes_home', return_value=profile_home):
-                feeds, targets = pkg.settings()
+                feeds, targets = rss_settings.settings()
                 self.assertEqual(set(feeds), {name})
                 self.assertEqual(set(targets), {name})
                 self.assertTrue(r.excludes_shorts(name))

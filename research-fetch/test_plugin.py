@@ -2,14 +2,19 @@ import importlib.util
 import json
 import pathlib
 import shlex
+import sys
 import unittest
 from unittest.mock import patch
 
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
-spec = importlib.util.spec_from_file_location('research_fetch_test', pathlib.Path(__file__).with_name('__init__.py'))
+ROOT = pathlib.Path(__file__).parent
+spec = importlib.util.spec_from_file_location('research_fetch_test', ROOT / '__init__.py',
+                                              submodule_search_locations=[str(ROOT)])
 p = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = p
 spec.loader.exec_module(p)
+from research_fetch_test import arxiv_search as ax, common, youtube_transcript as yt
 
 class Context:
     def __init__(self, result=None):
@@ -61,22 +66,22 @@ class Tests(unittest.TestCase):
         data = json.loads(c.tools['arxiv_search']['handler']({'query': value, 'title': value}))
         name, a = c.calls[0]; tokens = shlex.split(a['command'])
         self.assertEqual(name, 'terminal'); self.assertEqual(a['timeout'], 90)
-        self.assertEqual(tokens[:3], ['python3', p.CLI, 'arxiv-search'])
+        self.assertEqual(tokens[:3], ['python3', common.CLI, 'arxiv-search'])
         self.assertEqual(tokens[-2:], ['--', value]); self.assertIn('--title=' + value, tokens)
         self.assertIn('--no-save', tokens); self.assertIn('markdown', data)
     def test_youtube(self):
-        argv = shlex.split(p.command('youtube_transcript', {'url': 'https://youtu.be/abc?x=1&y=2'}))
+        argv = shlex.split(yt.command({'url': 'https://youtu.be/abc?x=1&y=2'}))
         self.assertIn('--subtitles', argv); self.assertNotIn('--sub-langs', argv)
         self.assertEqual(argv[-2], '--')
     def test_validation(self):
         for tool, args in [('youtube_transcript', {}), ('youtube_transcript', {'url':'https://x.com/a'}), ('arxiv_search', {'command':'id'}), ('arxiv_search', {'limit':True}), ('arxiv_search', {'limit':51}), ('arxiv_search', {'date_from':'2025-99-99'}), ('arxiv_search', {'query':'\x00'}), ('arxiv_search', {'sort':'bad'})]:
-            c = Context(); self.assertIn('error', json.loads(p.run(c, tool, args))); self.assertEqual(c.calls, [])
+            c = Context(); self.assertIn('error', json.loads((yt if tool == 'youtube_transcript' else ax).run(c, args))); self.assertEqual(c.calls, [])
     def test_markdown_passthrough(self):
-        c=Context(); self.assertEqual(json.loads(p.run(c, 'arxiv_search', {}))['markdown'], c.result['output'])
+        c=Context(); self.assertEqual(json.loads(ax.run(c, {}))['markdown'], c.result['output'])
     def test_errors(self):
         for result in [RuntimeError('denied'), {'exit_code':1,'output':'API failed'}, {'error':'timeout'}, 'not json', {'exit_code':0}, []]:
-            self.assertIn('error', json.loads(p.run(Context(result), 'arxiv_search', {})))
+            self.assertIn('error', json.loads(ax.run(Context(result), {})))
     def test_json_terminal(self):
-        self.assertEqual(json.loads(p.run(Context('{"exit_code":0,"output":"ok"}'), 'arxiv_search', {})), {'markdown':'ok'})
+        self.assertEqual(json.loads(ax.run(Context('{"exit_code":0,"output":"ok"}'), {})), {'markdown':'ok'})
 
 if __name__ == '__main__': unittest.main()

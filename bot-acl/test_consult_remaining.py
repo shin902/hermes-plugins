@@ -18,7 +18,7 @@ class RemainingTests(ConsultTests):
             handlers[name]=handler
             return original(name,toolset,schema,handler,**kwargs)
         with patch.object(ctx,'register_tool',side_effect=register):
-            consult.register_consult(ctx,self.domains)
+            consult.register(ctx,self.domains)
         handler=handlers['ask_bot']
         context=multiprocessing.get_context('fork')
         parent,child=context.Pipe()

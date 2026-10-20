@@ -78,7 +78,7 @@ class HardeningTests(ConsultTests):
             registered[name]=(schema,handler)
             return original(name,toolset,schema,handler,**kw)
         with patch.object(ctx,'register_tool',side_effect=register):
-            consult.register_consult(ctx,self.domains)
+            consult.register(ctx,self.domains)
         schema,handler=registered['ask_bot']
         Draft202012Validator.check_schema(schema['parameters'])
         validator=Draft202012Validator(schema['parameters'])

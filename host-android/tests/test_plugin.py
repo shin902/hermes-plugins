@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
+PLUGIN = Path(__file__).resolve().parents[1] / "host_android.py"
 spec = importlib.util.spec_from_file_location("host_android_plugin", PLUGIN)
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
@@ -169,6 +169,13 @@ class RecordingTests(unittest.TestCase):
         job=self.write_job(status="running",pid=os.getpid(),proc_start=plugin._proc_identity(os.getpid()))
         lock=plugin._jobs_dir()/"device-emulator-5554.lock"; lock.write_text(job["id"])
         with self.assertRaises(plugin.AndroidError): plugin._action_record_start({"device":"emulator-5554","duration":3,"confirm":True})
+
+    def test_worker_command_resolves_to_directly_runnable_named_module(self):
+        job_id="12345678-1234-4234-8234-123456789abc"
+        argv=plugin._worker_command(job_id)
+        self.assertEqual(Path(argv[1]).resolve(),PLUGIN.resolve())
+        result=subprocess.run([__import__("sys").executable,argv[1],"--record-worker","not-a-uuid"],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,2,result.stderr)
 
     def test_worker_fixed_argv_and_natural_completion(self):
         job=self.write_job(status="running",pid=os.getpid())
