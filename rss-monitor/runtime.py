@@ -12,7 +12,7 @@ import subprocess
 import time
 import uuid
 
-from . import config_dir
+from . import config_dir, home as current_home
 from .monitor import EMPTY_OUTPUT, MAX_OUTPUT_CHARS, TransientFetchError, fetch_feed
 
 
@@ -32,10 +32,10 @@ def write(path: Path, data: dict) -> None:
 
 
 @contextmanager
-def locked(home: Path, job_id: str):
+def locked(job_id: str):
     if not re.fullmatch(r'[A-Za-z0-9_-]+', job_id):
         raise ValueError('Invalid job ID')
-    directory = home / 'cron/rss-monitor'
+    directory = current_home() / 'cron/rss-monitor'
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / f'{job_id}.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -87,12 +87,12 @@ def initial(url: str, items: list[dict]) -> dict:
             'pending': [], 'current': None, 'monitor_generation': 0, 'output': EMPTY_OUTPUT}
 
 
-def collect(home: Path, job_id: str, url: str, *, now: float | None = None) -> dict:
+def collect(job_id: str, url: str, *, now: float | None = None) -> dict:
     at = time.time() if now is None else now
-    with locked(home, job_id) as path:
+    with locked(job_id) as path:
         state = read(path, url) if path.exists() else None
         try:
-            items = fetch_feed(url, diagnostics_path=home / 'logs/cron-rss' / f'{job_id}.jsonl')
+            items = fetch_feed(url, diagnostics_path=current_home() / 'logs/cron-rss' / f'{job_id}.jsonl')
         except TransientFetchError as exc:
             health_path = path.with_name(f'{job_id}-health.json')
             health = json.loads(health_path.read_text()) if health_path.exists() else {}
@@ -159,9 +159,9 @@ def filter_shorts(state: dict) -> bool:
     return True
 
 
-def prepare(home: Path, job_id: str) -> str:
+def prepare(job_id: str) -> str:
     """Nonce only unacknowledged batches: native pre-agent snapshots cannot lose a retry."""
-    with locked(home, job_id) as path:
+    with locked(job_id) as path:
         state = read(path)
         if excludes_shorts(job_id) and filter_shorts(state):
             write(path, state)
@@ -187,10 +187,10 @@ def prepare(home: Path, job_id: str) -> str:
         return state['output']
 
 
-def send(home: Path, target: str, text: str) -> dict:
+def send(target: str, text: str) -> dict:
     """Public CLI; no internal send-function imports or credential extraction."""
     env = os.environ.copy()
-    env['HERMES_HOME'] = str(home)
+    env['HERMES_HOME'] = str(current_home())
     result = subprocess.run(['hermes', 'send', '--to', target, '--json', '--file', '-'],
                             input=text, text=True, capture_output=True, env=env, timeout=60)
     data = json.loads(result.stdout)
@@ -215,7 +215,7 @@ def chunks(text: str) -> list[str]:
     return pieces
 
 
-def publish(home: Path, job_id: str, execution_id: str, batch_id: str, text: str,
+def publish(job_id: str, execution_id: str, batch_id: str, text: str,
             target: str, *, sender=send) -> dict:
     """LLM selects summary; code alone sends/ACKs, fencing ambiguous windows."""
     if not execution_id or not re.fullmatch(r'discord:\d+(?::\d+)?', target):
@@ -224,7 +224,7 @@ def publish(home: Path, job_id: str, execution_id: str, batch_id: str, text: str
         raise ValueError('Invalid summary size')
     if re.search(r'MEDIA:|\[\[as_document\]\]|@everyone|@here|<@', text, re.I):
         raise ValueError('RSS publish is text-only; media/mention directives are forbidden')
-    with locked(home, job_id) as path:
+    with locked(job_id) as path:
         state = read(path)
         last = state.get('last_delivery')
         if last and last['batch_id'] == batch_id:
@@ -243,7 +243,7 @@ def publish(home: Path, job_id: str, execution_id: str, batch_id: str, text: str
         write(path, state)  # Before the first transport side effect; survives SIGKILL.
         try:
             for part in chunks(text):
-                response = sender(home, target, part)
+                response = sender(target, part)
                 if (not isinstance(response, dict) or response.get('success') is not True
                         or not isinstance(response.get('message_id'), str) or not response['message_id'].strip()
                         or response.get('warnings')

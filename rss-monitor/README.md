@@ -23,6 +23,9 @@ Link the canonical plugin into `$HERMES_HOME/plugins/rss-monitor/`. Configuratio
 
 Every job processes exactly one article per run. Remaining articles stay pending;
 retries retain the same article until delivery is confirmed. Batch size is not configurable.
+Collection, preparation and publication use the current Hermes profile only;
+explicit home selection and the legacy `run_monitor(home, ...)` entry point are no longer supported.
+This removes an API feature; it does not add filesystem or process isolation.
 
 Do not let the model edit state or split send and read operations. Generic send_message tools are not an alternative to the dedicated publish tool. Keep standard cron automatic delivery local.
 
