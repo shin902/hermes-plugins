@@ -79,6 +79,25 @@ class BotAclTests(unittest.TestCase):
                     self.assertEqual(acl.check_bot_acl("message_agent", {"target": "default"})["action"], "block")
                     self.assertIsNone(acl.check_bot_acl("terminal", object()))
 
+    def test_bot_task_spawn_is_covered_by_pre_tool_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.yaml").write_text("{}\n")
+            for name in ("coding", "mail", "local"):
+                home = root / "profiles" / name
+                home.mkdir(parents=True)
+                (home / "profile.yaml").write_text("{}\n")
+            domains = {"main": {"coding", "mail"}, "local": {"local"}}
+            token = set_hermes_home_override(root / "profiles/coding")
+            try:
+                with patch.object(acl, "DOMAINS", domains):
+                    blocked = acl.check_bot_acl("bot_task", {"action": "spawn", "target": "local"})
+                    self.assertEqual(blocked["action"], "block")
+                    self.assertIsNone(acl.check_bot_acl("bot_task", {"action": "spawn", "target": "mail"}))
+                    self.assertIsNone(acl.check_bot_acl("bot_task", {"action": "status", "task_id": "t"}))
+            finally:
+                reset_hermes_home_override(token)
+
     def test_multiplex_hook_workers_preserve_each_source_context(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

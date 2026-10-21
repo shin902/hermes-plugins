@@ -20,31 +20,34 @@ class RemainingTests(ConsultTests):
         with patch.object(ctx,'register_tool',side_effect=register):
             consult.register(ctx,self.domains)
         handler=handlers['ask_bot']
+        sid=self.recipient_session()
+        args={**self.args,'mode':'resume','session_id':sid}
         context=multiprocessing.get_context('fork')
         parent,child=context.Pipe()
         def holder():
-            def run(*args):
+            def run(*unused):
                 child.send('locked')
                 child.recv()
                 return 0,self.output,'',False
             with patch.object(consult,'_run',side_effect=run),patch.object(consult.shutil,'which',return_value='/fixture/hermes'):
-                child.send(json.loads(handler({**self.args,'mode':'bot_chat'})))
+                child.send(json.loads(handler(args)))
         process=context.Process(target=holder)
         process.start()
         try:
             self.assertTrue(parent.poll(5))
             self.assertEqual(parent.recv(),'locked')
             with patch.object(consult,'_run',return_value=(0,self.output,'',False)) as run,patch.object(consult.shutil,'which',return_value='/fixture/hermes'):
-                self.assertEqual(json.loads(handler({**self.args,'mode':'bot_chat'}))['status'],'target_busy')
+                self.assertEqual(json.loads(handler(args))['status'],'target_busy')
                 run.assert_not_called()
                 self.assertEqual(json.loads(handler(self.args))['status'],'completed')
-                self.assertEqual(json.loads(handler({**self.args,'target':'default','mode':'bot_chat'}))['status'],'completed')
+                independent=self.recipient_session('mail','independent')
+                self.assertEqual(json.loads(handler({**args,'session_id':independent}))['status'],'completed')
             parent.send('release')
             self.assertTrue(parent.poll(5))
             self.assertEqual(parent.recv()['status'],'completed')
             process.join(5)
             self.assertEqual(process.exitcode,0)
-            result,_=self.call({**self.args,'mode':'bot_chat'})
+            result,_=self.call(args)
             self.assertEqual(result['status'],'completed')
         finally:
             if process.is_alive():

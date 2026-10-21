@@ -1,16 +1,23 @@
-"""Parent-owned, bounded child tasks over the installed TUI stdio protocol.
+"""Parent-owned asynchronous bot tasks over the public Hermes CLI.
 
-No HTTP listener, arbitrary RPC passthrough, resume, or caller-supplied session IDs.
-State is deliberately process-local and disappears with the owning process.
+Each task turn is one ``hermes -p <target> chat --query-file - --format
+stream-json`` subprocess. There is no TUI JSON-RPC transport, HTTP listener,
+arbitrary RPC passthrough, or caller-supplied runtime session ID. A task may
+open a fresh child session or resume one exact target-owned stored session.
+
+Steering interrupts the active CLI process group with SIGTERM, waits for the
+predecessor to exit, then resumes the same returned session ID in the same
+target profile with only the new guidance. Stop wins races and blocks automatic
+resume. Forced shutdown or a missing session ID also blocks resume. State is
+process-local and disappears with the owning process.
 """
 import atexit
 import contextvars
-import importlib.util
 import json
 import os
-import queue
+import signal
 import subprocess
-import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -19,163 +26,353 @@ from pathlib import Path
 from . import ask_bot
 from .policy import check
 
+PROMPT = (
+    "Run parent-owned child bot tasks with bot_task from ordinary sessions. "
+    "Use list_bot_peers to discover allowed teammates. spawn requires target and "
+    "message. Choose mode=new_session for an isolated child (default) or "
+    "mode=resume with target and an exact target-owned session_id. bot_task never "
+    "substitutes another mode. There is no wall-clock timer. Use status or wait to "
+    "retrieve a result. steer interrupts the active CLI turn with SIGTERM, waits "
+    "for it to exit, then resumes the same returned session with only the new "
+    "guidance; the original prompt is never resent. stop wins races. There is no "
+    "automatic retry, mode switch, or resend."
+)
 SCHEMA = {
     "name": "bot_task",
-    "description": "Run and control bounded same-group child bot tasks owned by this parent session. spawn requires target/message; status/stop/steer require task_id; list takes no extra fields. No arbitrary session access. steer reports ambiguous acceptance, never claims guaranteed active-turn delivery (backend may queue a follow-up during compression). Results are retrieved with status; no automatic notifications.",
+    "description": "Run and control same-group child bot tasks owned by this parent session. spawn requires target/message and chooses mode=new_session (default) or resume with an exact target-owned session_id. There is no wall-clock timer. status/wait/stop/steer require task_id; list takes no extra fields. steer interrupts the active public CLI turn with SIGTERM, waits for the predecessor to exit, then resumes the same returned session with only the new guidance; it never resends the original prompt. stop wins races and blocks automatic resume. Results are retrieved with status or wait; no automatic notifications. No automatic retry, mode switch, or resend.",
     "parameters": {"type": "object", "additionalProperties": False,
         "properties": {
             "action": {"type": "string", "enum": ["spawn", "list", "status", "wait", "steer", "stop"]},
-            "target": {"type": "string"}, "message": {"type": "string", "maxLength": 16000},
+            "target": {"type": "string"},
+            "message": {"type": "string", "maxLength": 16000},
             "task_id": {"type": "string"},
-            "timeout_seconds": {"type": "integer", "minimum": 30, "maximum": 600, "default": 300}},
+            "mode": {"type": "string", "enum": ["new_session", "resume"], "default": "new_session"},
+            "session_id": {"type": "string", "description": "Only with mode=resume: an exact stored session ID in the target profile."},
+        },
         "required": ["action"]}}
 _LOCK = threading.RLock()
 _TASKS = {}
 
+SHUTDOWN_GRACE = 5.0
+KILL_GRACE = 5.0
+POLL_INTERVAL = 0.05
+MAX_TASKS = 16
+MAX_TASKS_PER_OWNER = 4
+RETAIN_COMPLETED = 64
 
-class Child:
-    def __init__(self, argv, env, cwd, timeout):
-        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", env=env, cwd=cwd,
-            start_new_session=True, bufsize=1)
+
+class Turn:
+    """One public-CLI turn. Exactly one turn may own a task's writer at a time."""
+
+    def __init__(self, argv, payload, env, cwd, scratch, target, mode,
+                 requested_session_id=None):
+        self.argv = argv
+        self.payload = payload
+        self.env = env
+        self.cwd = str(cwd)
+        self.scratch = Path(scratch)
+        self.target = target
+        self.mode = mode
+        self.requested_session_id = requested_session_id
         self.lock = threading.RLock()
-        self.pending = {}
-        self.sid = None
+        self.proc = None
+        self.session_id = None
         self.reply = ""
+        self.partial_reply = None
+        self.error = None
         self.outcome = None
-        self.closed = False
-        self.ready = threading.Event()
+        self.exit_code = None
+        self.forced = False
+        self.interrupted = False
+        self.signaled = False
         self.done = threading.Event()
-        self.deadline = time.monotonic() + timeout
-        self.timer = threading.Timer(timeout, self.expire)
-        self.timer.daemon = True
-        self.reader = threading.Thread(target=self.read, daemon=True)
-        self.reader.start()
-        self.timer.start()
+        self.started = threading.Event()
+        self._cancel_requested = threading.Event()
+        self._offset = 0
+        self._pending = b""
+        self._dropping = False
+        self._output = tempfile.TemporaryFile(dir=self.scratch)
+        self._errors = tempfile.TemporaryFile(dir=self.scratch)
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="bot-task-turn")
+        self._thread.start()
 
-    def send(self, frame):
-        with self.lock:
-            if self.closed:
-                raise RuntimeError("child transport is closed")
-            self.proc.stdin.write(json.dumps(frame, ensure_ascii=False) + "\n")
-            self.proc.stdin.flush()
-
-    def rpc(self, method, params):
-        key = uuid.uuid4().hex
-        response = queue.Queue(maxsize=1)
-        with self.lock:
-            self.pending[key] = response
-        try:
-            self.send({"jsonrpc": "2.0", "id": key, "method": method, "params": params})
-            result = response.get(timeout=max(.01, min(30, self.deadline - time.monotonic())))
-            if "error" in result:
-                raise RuntimeError(str(result["error"]))
-            return result.get("result", {})
-        except queue.Empty as exc:
-            raise RuntimeError("RPC timeout; processing outcome is unknown; do not resend") from exc
-        finally:
-            with self.lock:
-                self.pending.pop(key, None)
-
-    def read(self):
+    def _collect(self):
         try:
             while True:
-                line = self.proc.stdout.readline(1048577)
-                if not line:
+                chunk = os.pread(self._output.fileno(), 65536, self._offset)
+                if not chunk:
                     break
-                if len(line) > 1048576:
-                    raise RuntimeError("oversized child protocol frame")
-                frame = json.loads(line)
-                if not isinstance(frame, dict):
-                    raise RuntimeError("invalid child protocol frame")
-                if "method" in frame and "id" in frame:
-                    # Never auto-approve, answer secrets, or silently hang on an unsupported UI request.
-                    self.send({"jsonrpc": "2.0", "id": frame["id"], "error": {
-                        "code": -32601, "message": "Unattended bot task cannot answer interactive requests"}})
-                elif frame.get("method") == "event":
-                    event = frame.get("params", {})
-                    if event.get("type") == "gateway.ready":
-                        self.ready.set()
-                    elif event.get("session_id") == self.sid and event.get("type") == "message.complete":
-                        payload = event.get("payload", {})
-                        with self.lock:
-                            self.reply = str(payload.get("text", ""))[:32000]
-                            self.outcome = payload.get("status", "completed")
-                        self.done.set()
-                else:
-                    with self.lock:
-                        waiter = self.pending.get(frame.get("id"))
-                    if waiter:
-                        waiter.put_nowait(frame)
-        except Exception as exc:
-            with self.lock:
-                self.outcome = "transport_failed: " + str(exc)
-        finally:
-            with self.lock:
-                for waiter in self.pending.values():
-                    if waiter.empty():
-                        waiter.put_nowait({"error": "child transport exited; outcome unknown"})
-            self.ready.set()
-            self.done.set()
+                self._offset += len(chunk)
+                for part in chunk.splitlines(keepends=True):
+                    ended = part.endswith(b"\n")
+                    if not self._dropping:
+                        self._pending += part
+                        if len(self._pending) > 65536:
+                            self._pending, self._dropping = b"", True
+                        elif ended:
+                            try:
+                                record = json.loads(self._pending)
+                            except (ValueError, TypeError):
+                                record = None
+                            if (isinstance(record, dict) and record.get("type") == "system"
+                                    and record.get("subtype") == "init"):
+                                sid = ask_bot._valid_id(record.get("session_id"))
+                                if sid:
+                                    with self.lock:
+                                        if self.session_id is None:
+                                            self.session_id = sid
+                    if ended:
+                        self._pending, self._dropping = b"", False
+        except (OSError, ValueError):
+            pass
 
-    def expire(self):
-        with self.lock:
-            if not self.closed:
-                self.outcome = "timeout_unknown"
-        self.close()
+    def _close_stdin(self):
+        try:
+            if self.proc is not None and self.proc.stdin is not None:
+                self.proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
 
-    def close(self):
-        with self.lock:
-            if self.closed:
+    def _reap(self):
+        """Close stdin and boundedly stop/reap the child before publication.
+
+        Called by the turn thread on every exit path. Cleanup is best effort so
+        a failure here never replaces the diagnostic that led to this path.
+        """
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            self._close_stdin()
+            if proc.poll() is not None:
                 return
-            self.closed = True
-            self.timer.cancel()
-        ask_bot._stop_group(self.proc)
-        for stream in (self.proc.stdin, self.proc.stdout):
+            ask_bot._signal_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=SHUTDOWN_GRACE)
+            except subprocess.TimeoutExpired:
+                ask_bot._signal_group(proc, signal.SIGKILL)
+                proc.wait(timeout=KILL_GRACE)
+        except Exception:
+            pass
+
+    def _close_streams(self):
+        for stream in (self._output, self._errors):
             try:
                 stream.close()
             except Exception:
                 pass
 
+    def _finish(self, failure=None):
+        try:
+            output = ask_bot._tail(self._output)
+            errors = ask_bot._tail(self._errors, 8192)
+        except Exception as exc:
+            output, errors = "", "transport_failed: " + str(exc)
+            if failure is None:
+                failure = exc
+        if failure is None:
+            try:
+                parsed = ask_bot._outcome(self.exit_code, output, errors, False,
+                                          self.target, self.mode)
+            except Exception as exc:
+                parsed = {"status": "failed",
+                          "error": "transport_failed: " + str(exc)}
+        else:
+            parsed = {"status": "failed",
+                      "error": "transport_failed: " + str(failure)}
+        with self.lock:
+            # A terminal result may carry a compression-continuation ID that
+            # differs from the turn's init ID. Prefer the parsed terminal ID;
+            # fall back to the init ID, then the exact requested resume ID.
+            self.session_id = (parsed.get("session_id") or self.session_id
+                               or (self.requested_session_id if self.mode == "resume" else None))
+            self.reply = parsed.get("reply", "") if isinstance(parsed.get("reply"), str) else ""
+            self.partial_reply = parsed.get("partial_reply")
+            self.error = parsed.get("error")
+            self.outcome = parsed.get("status", "failed")
+            if self.interrupted:
+                self.outcome = "forced_stop_unknown" if self.forced else "interrupted"
+                if self.forced:
+                    self.error = ("CLI turn required SIGKILL; persistence is unknown and "
+                                  "automatic resume is blocked.")
+                elif not self.error:
+                    self.error = "CLI turn was interrupted"
+                if self.partial_reply is None and self.reply:
+                    self.partial_reply = self.reply
+                self.reply = ""
+        self._close_streams()
+        self.done.set()
 
-def _start(task, target, text, timeout):
-    child = None
+    def _run(self):
+        failure = None
+        try:
+            # Encode before Popen so an invalid payload cannot leave a child
+            # blocked on stdin. Post-Popen failures still go through _reap.
+            payload = self.payload.encode("utf-8")
+            self.proc = subprocess.Popen(
+                self.argv, stdin=subprocess.PIPE, stdout=self._output,
+                stderr=self._errors, env=self.env, cwd=self.cwd,
+                start_new_session=True)
+            self.started.set()
+            if self._cancel_requested.is_set():
+                ask_bot._signal_group(self.proc, signal.SIGTERM)
+                # A stop that won startup must not hand the child the task the
+                # caller already cancelled. Close stdin without the payload so
+                # the child sees EOF, then let the normal loop wait and reap it.
+                self._close_stdin()
+            else:
+                try:
+                    self.proc.stdin.write(payload)
+                    self.proc.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            while True:
+                self._collect()
+                if self.proc.poll() is not None:
+                    break
+                time.sleep(POLL_INTERVAL)
+            self.exit_code = self.proc.returncode
+            self._collect()
+        except Exception as exc:
+            failure = exc
+        finally:
+            # A failure before Popen must still release any started waiter.
+            self.started.set()
+        # The turn thread owns shutdown, reaping and publication on every path.
+        self._reap()
+        self._finish(failure)
+
+    def interrupt(self, grace=None, kill_grace=None):
+        """Claim and stop this turn. Return None if completion already won."""
+        grace = SHUTDOWN_GRACE if grace is None else grace
+        kill_grace = KILL_GRACE if kill_grace is None else kill_grace
+        self._cancel_requested.set()
+        with self.lock:
+            if self.done.is_set() or self.outcome is not None:
+                return None
+            leader_exited = self.proc is not None and self.proc.poll() is not None
+            if not leader_exited:
+                self.interrupted = True
+        if leader_exited:
+            # The process exited; let the turn thread publish completion. The
+            # completion path needs this same lock, so wait only after releasing it.
+            self.done.wait(kill_grace)
+            return None
+        if not self.started.wait(grace):
+            self.done.wait(kill_grace)
+            with self.lock:
+                if self.forced:
+                    return "forced"
+                if not self.done.is_set():
+                    return None
+                if not self.signaled and self.outcome == "failed":
+                    return None
+                return "graceful"
+        proc = self.proc
+        if proc is None:
+            self.done.wait(kill_grace)
+            with self.lock:
+                return "forced" if self.forced else None
+        if proc.poll() is None:
+            self.signaled = True
+            ask_bot._signal_group(proc, signal.SIGTERM)
+            if not self.done.wait(grace):
+                with self.lock:
+                    self.forced = True
+                ask_bot._signal_group(proc, signal.SIGKILL)
+                self.done.wait(kill_grace)
+        else:
+            self.done.wait(kill_grace)
+        with self.lock:
+            if self.forced:
+                return "forced"
+            if not self.done.is_set():
+                return None
+            if not self.signaled and self.outcome == "failed":
+                # Startup failed before we could signal anything; this is not an
+                # interruption and must not trigger an automatic resume.
+                return None
+            return "graceful"
+
+
+def _target_home(root, target):
+    return Path(root) if target == "default" else Path(root) / "profiles" / target
+
+
+def _source_and_root():
+    return ask_bot.identity()
+
+
+def _launch(task, target, text, mode, session_id, source, reason):
+    with task["lock"]:
+        if task.get("cancelled") or task["stop"].is_set():
+            return None
+    executable = ask_bot._executable()
+    if not executable:
+        raise RuntimeError("Hermes CLI is not available on this host")
+    _, root = _source_and_root()
+    target_home = _target_home(root, target)
+    env, scratch = ask_bot._child_env(target_home)
+    argv = ask_bot._cli_argv(executable, target, mode, session_id, "bot_task")
+    payload = ask_bot._payload(source, text, task=(reason != "steer"),
+                               steer=(reason == "steer"))
+    turn = Turn(argv, payload, env, Path.home(), scratch, target, mode, session_id)
+    with task["lock"]:
+        if task.get("cancelled") or task["stop"].is_set():
+            turn.interrupt(grace=1.0, kill_grace=2.0)
+            return None
+        task["turn"] = turn
+        task["turns"] = task.get("turns", 0) + 1
+        task["status"] = "running"
+        task["error"] = None
+        task["reply"] = ""
+        task["partial_reply"] = None
+        task["forced_kill"] = False
+        task["interrupted"] = False
+        if mode == "resume":
+            task["session_id"] = session_id
+    threading.Thread(target=_watch, args=(task, turn), daemon=True,
+                     name="bot-task-watch-" + task["id"][:8]).start()
+    return turn
+
+
+def _watch(task, turn):
+    turn.done.wait()
+    with task["lock"]:
+        if task.get("turn") is not turn:
+            return
+        if task.get("status") not in ("starting", "running", "interrupting"):
+            # A control action (stop/steer) already recorded the task-level
+            # outcome for this turn; do not let the settled predecessor
+            # overwrite its actionable status or error.
+            return
+        if task.get("cancelled") and turn.interrupted:
+            task["status"] = "stopped_unknown" if turn.forced else "stopped"
+        else:
+            task["status"] = turn.outcome or "failed"
+        task["session_id"] = turn.session_id or task.get("session_id")
+        task["error"] = turn.error
+        task["reply"] = turn.reply
+        task["partial_reply"] = turn.partial_reply
+        task["forced_kill"] = turn.forced
+        task["interrupted"] = turn.interrupted
+
+
+def _start(task, target, text, mode, requested_session_id):
     try:
-        _, root = ask_bot.identity()
-        home = root if target == "default" else root / "profiles" / target
-        env = dict(os.environ, HERMES_HOME=str(home), BOT_ACL_CONSULT_CHILD="1")
-        for name in ("HERMES_TUI_ATTACH_URL", "HERMES_TUI_SIDECAR_URL", "HERMES_PROFILE", "HERMES_SESSION_ID"):
-            env.pop(name, None)
-        spec = importlib.util.find_spec("tui_gateway")
-        if not spec or not spec.origin:
-            raise RuntimeError("official TUI gateway is not installed")
-        source = str(Path(spec.origin).parent.parent)
-        env["PYTHONPATH"] = source
-        with task["lock"]:
-            if task.get("cancelled"):
-                return
-            child = Child([sys.executable, "-m", "tui_gateway.entry"], env, source, timeout)
-            task["child"] = child
-        if not child.ready.wait(min(30, timeout)) or child.proc.poll() is not None:
-            raise RuntimeError("child gateway did not become ready")
-        child.rpc("client.capabilities", {"server_requests": True})
-        result = child.rpc("session.create", {"source": "bot_task", "title": "Bot task",
-            "close_on_disconnect": True, "follow_profile_config": True})
-        child.sid = result["session_id"]
-        if not isinstance(child.sid, str) or not child.sid:
-            raise RuntimeError("child returned invalid session ID")
-        with task["lock"]:
-            if task.get("cancelled"):
-                child.close()
-                return
-            task["status"] = "running"
-        child.rpc("prompt.submit", {"session_id": child.sid, "text": text})
+        source, root = _source_and_root()
+        if mode == "resume":
+            ask_bot._require_exact_session_id(_target_home(root, target),
+                                              requested_session_id)
+        _launch(task, target, text, mode, requested_session_id, source, "spawn")
     except Exception as exc:
         with task["lock"]:
             if not task.get("cancelled"):
-                task.update(status="failed_unknown", error=str(exc))
-        if child:
-            child.close()
+                task["status"] = "failed_unknown"
+                task["error"] = str(exc)
+                task["next_step"] = ("Report the failure. Do not automatically retry, "
+                                     "resend, or switch modes.")
 
 
 def _owner(kwargs):
@@ -185,15 +382,165 @@ def _owner(kwargs):
     return (str(ask_bot.get_hermes_home()), sid)
 
 
+def _refresh(task):
+    turn = task.get("turn")
+    if not turn or not turn.done.is_set() or task.get("turn") is not turn:
+        return
+    if task.get("status") not in ("starting", "running", "interrupting"):
+        # A settled task-level outcome is authoritative for this turn.
+        return
+    if task.get("cancelled") and turn.interrupted:
+        task["status"] = "stopped_unknown" if turn.forced else "stopped"
+    else:
+        task["status"] = turn.outcome or "failed"
+    task["session_id"] = turn.session_id or task.get("session_id")
+    task["error"] = turn.error
+    task["reply"] = turn.reply
+    task["partial_reply"] = turn.partial_reply
+    task["forced_kill"] = turn.forced
+    task["interrupted"] = turn.interrupted
+
+
 def _snapshot(task):
-    child = task["child"]
-    return {"task_id": task["id"], "target": task["target"], "status": task["status"],
-            "session_id": child.sid if child else None,
-            "reply": child.reply if child else "", "error": task.get("error"),
-            "finality_verified": False,
-            "pending_steer_replay": "backend-owned; no client resend; exact-once not observable via this protocol",
-            "restart_recovery": False,
-            "deadline_seconds": max(0, int(child.deadline - time.monotonic())) if child else 0}
+    turn = task.get("turn")
+    # A task-level error (missing session ID, revoked ACL, replacement launch
+    # failure) describes the action that just failed. Prefer it over the
+    # predecessor turn's interruption error, which would mask the actionable
+    # cause; fall back to the turn error until the turn is synchronized.
+    error = task.get("error")
+    if error is None and turn is not None:
+        error = turn.error
+    snapshot = {
+        "task_id": task["id"], "target": task["target"],
+        "mode": task.get("mode", "new_session"), "status": task["status"],
+        "session_id": task.get("session_id") or (turn.session_id if turn else None),
+        "requested_session_id": task.get("requested_session_id"),
+        "reply": (turn.reply if turn else task.get("reply", "")) or "",
+        "error": error,
+        "next_step": task.get("next_step"),
+        "turn": task.get("turns", 0),
+        "steer_count": task.get("steer_count", 0),
+        "steer_status": task.get("steer_status"),
+        "stop_status": task.get("stop_status"),
+        "interrupted": bool(turn.interrupted) if turn else bool(task.get("interrupted")),
+        "forced_kill": bool(turn.forced) if turn else bool(task.get("forced_kill")),
+        "original_prompt_resent": False,
+        "finality_verified": bool(turn and turn.done.is_set()
+                                  and not turn.forced and not turn.interrupted),
+        "transport": "public-cli-stream-json",
+        "resident": False,
+    }
+    partial = turn.partial_reply if turn and turn.partial_reply is not None else task.get("partial_reply")
+    if partial is not None:
+        snapshot["partial_reply"] = partial
+    return snapshot
+
+
+def _steer_ended(task):
+    """Record that steer found no live writer, preserving the settled outcome."""
+    _refresh(task)
+    if task.get("status") == "completed":
+        task["steer_status"] = "not_applied_completed"
+        task["error"] = "The active turn completed before steer; no guidance was sent."
+    else:
+        task["steer_status"] = "not_applied"
+        # Preserve the settled turn's real failure (for example a quota error);
+        # the steer status already records that no guidance was sent.
+        if not task.get("error"):
+            task["error"] = ("The active turn had already ended before steer; "
+                             "no guidance was sent.")
+    return _snapshot(task)
+
+
+def _steer(task, domains, text):
+    if task.get("cancelled") or task["stop"].is_set():
+        turn = task.get("turn")
+        if turn is not None and turn.done.is_set() and not turn.interrupted:
+            return _steer_ended(task)
+        task["status"] = "stopped"
+        task["steer_status"] = "stopped"
+        task["error"] = "Stop won the race; guidance was not resumed."
+        return _snapshot(task)
+    turn = task.get("turn")
+    if turn is None or turn.done.is_set() or task["status"] not in ("starting", "running", "interrupting"):
+        if turn is not None and turn.done.is_set():
+            return _steer_ended(task)
+        task["steer_status"] = "not_applied"
+        task["error"] = "Task has no active turn; no guidance was sent."
+        return _snapshot(task)
+    session_id = turn.session_id or task.get("session_id")
+    task["status"] = "interrupting"
+    result = turn.interrupt()
+    session_id = turn.session_id or session_id or task.get("session_id")
+    if task.get("cancelled") or task["stop"].is_set():
+        task["forced_kill"] = turn.forced
+        if turn.done.is_set() and not turn.interrupted:
+            # Stop won, but the turn had already settled on its own: keep the
+            # truthful completed/failed outcome instead of rewriting it.
+            return _steer_ended(task)
+        task["status"] = "stopped_unknown" if turn.forced else "stopped"
+        task["steer_status"] = "stopped"
+        task["error"] = "Stop won the race; guidance was not resumed."
+        return _snapshot(task)
+    if result is None:
+        return _steer_ended(task)
+    if turn.forced:
+        task["status"] = "steer_blocked"
+        task["steer_status"] = "blocked_forced_kill"
+        task["error"] = ("The active CLI turn required SIGKILL; persistence is uncertain, "
+                         "so automatic resume was blocked.")
+        task["next_step"] = ("Do not resend automatically. Inspect the target session "
+                             "before starting a new task.")
+        task["forced_kill"] = True
+        return _snapshot(task)
+    if not session_id:
+        task["status"] = "steer_blocked"
+        task["steer_status"] = "blocked_no_session_id"
+        task["error"] = ("The interrupted CLI turn returned no session_id; automatic "
+                         "resume was blocked.")
+        task["next_step"] = ("Do not resend automatically. Start a new task only with "
+                             "explicit user direction.")
+        return _snapshot(task)
+    denied = check(domains, "message_agent", {"target": task["target"]})
+    if denied:
+        task["status"] = "blocked"
+        task["steer_status"] = "blocked_acl"
+        task["error"] = denied["message"]
+        return _snapshot(task)
+    try:
+        source, _ = _source_and_root()
+        launched = _launch(task, task["target"], text, "resume", session_id,
+                           source, "steer")
+    except Exception as exc:
+        task["status"] = "steer_blocked"
+        task["steer_status"] = "blocked_launch_failed"
+        task["error"] = str(exc)
+        return _snapshot(task)
+    if launched is None:
+        task["status"] = "stopped"
+        task["steer_status"] = "stopped"
+        task["error"] = "Stop won the race; guidance was not resumed."
+        return _snapshot(task)
+    task["steer_count"] = task.get("steer_count", 0) + 1
+    task["steer_status"] = "resumed"
+    task["next_step"] = ("New guidance was submitted on a resumed CLI turn; the "
+                         "original prompt was not resent.")
+    return _snapshot(task)
+
+
+def _is_active(task):
+    if task.get("cancelled"):
+        return False
+    # A steer handoff remains active after its predecessor turn settles: the
+    # replacement turn is launched under the same task record. Counting it as
+    # inactive here would let a concurrent spawn exceed the owner/process limits
+    # and could evict the handoff task from _TASKS.
+    if task["status"] == "interrupting":
+        return True
+    turn = task.get("turn")
+    if turn is not None and turn.done.is_set():
+        return False
+    return task["status"] in ("starting", "running")
 
 
 def handle(domains, args, **kwargs):
@@ -201,8 +548,10 @@ def handle(domains, args, **kwargs):
         if os.environ.get(ask_bot.DEPTH_ENV) == "1":
             raise ValueError("nested child tasks are disabled")
         owner = _owner(kwargs)
+        if "timeout_seconds" in args:
+            raise ValueError("timeout_seconds is not supported; bot tasks are always unlimited")
         action = args.get("action")
-        allowed = {"spawn": {"action", "target", "message", "timeout_seconds"},
+        allowed = {"spawn": {"action", "target", "message", "mode", "session_id"},
                    "list": {"action"}, "status": {"action", "task_id"},
                    "wait": {"action", "task_id"},
                    "stop": {"action", "task_id"}, "steer": {"action", "task_id", "message"}}
@@ -212,28 +561,51 @@ def handle(domains, args, **kwargs):
             text = args.get("message")
             if not isinstance(text, str) or not text.strip() or len(text) > 16000:
                 raise ValueError("message must contain 1-16000 characters")
+        if action == "spawn":
+            mode = args.get("mode", "new_session")
+            if mode not in ("new_session", "resume"):
+                raise ValueError("mode must be new_session or resume")
+            requested_session_id = args.get("session_id")
+            if mode == "resume":
+                if not ask_bot._valid_id(requested_session_id) or requested_session_id.lower() == "latest":
+                    raise ValueError("resume requires an exact session_id, not a title or latest")
+            elif "session_id" in args:
+                raise ValueError("session_id is only allowed with mode=resume")
         with _LOCK:
             if action == "list":
-                return json.dumps({"tasks": [_snapshot(t) for t in _TASKS.values()
-                    if t["owner"] == owner and check(domains, "message_agent", {"target": t["target"]}) is None]})
+                tasks = []
+                for task in _TASKS.values():
+                    if task["owner"] != owner:
+                        continue
+                    if check(domains, "message_agent", {"target": task["target"]}) is not None:
+                        continue
+                    with task["lock"]:
+                        _refresh(task)
+                        tasks.append(_snapshot(task))
+                return json.dumps({"tasks": tasks})
             if action == "spawn":
-                timeout = args.get("timeout_seconds", 300)
-                if isinstance(timeout, bool) or not isinstance(timeout, int) or not 30 <= timeout <= 600:
-                    raise ValueError("timeout_seconds must be an integer between 30 and 600")
                 denied = check(domains, "message_agent", args)
                 if denied:
                     return json.dumps({"status": "blocked", "error": denied["message"]})
-                active = [t for t in _TASKS.values() if t["status"] == "starting" or (t["child"] and not t["child"].closed)]
-                if len(active) >= 16 or sum(t["owner"] == owner for t in active) >= 4:
-                    raise ValueError("active child task limit reached (4 per parent, 16 per process)")
-                # Bounded retained history. Never evict a live task.
-                completed = [k for k,t in _TASKS.items() if t["status"] != "starting" and (t["child"] is None or t["child"].closed)]
-                for key in completed[:-64]:
-                    del _TASKS[key]
+                # Normalize only after the live ACL has accepted the canonical target.
                 target = args["target"].strip().removeprefix("@")
                 target = "default" if target == "hermes" else target
+                active = [t for t in _TASKS.values() if _is_active(t)]
+                if (len(active) >= MAX_TASKS
+                        or sum(t["owner"] == owner for t in active) >= MAX_TASKS_PER_OWNER):
+                    raise ValueError("active child task limit reached (4 per parent, 16 per process)")
+                completed = [k for k, t in _TASKS.items()
+                             if not _is_active(t) and (t.get("turn") is None
+                                                       or t["turn"].done.is_set())]
+                for key in completed[:-RETAIN_COMPLETED]:
+                    del _TASKS[key]
                 task = {"id": uuid.uuid4().hex, "owner": owner, "target": target,
-                        "status": "starting", "child": None, "lock": threading.RLock()}
+                        "mode": mode,
+                        "requested_session_id": requested_session_id if mode == "resume" else None,
+                        "status": "starting", "turn": None, "lock": threading.RLock(),
+                        "stop": threading.Event(), "cancelled": False,
+                        "turns": 0, "steer_count": 0, "steer_status": None,
+                        "session_id": requested_session_id if mode == "resume" else None}
                 _TASKS[task["id"]] = task
             else:
                 task = _TASKS.get(args.get("task_id"))
@@ -243,43 +615,59 @@ def handle(domains, args, **kwargs):
                 denied = check(domains, "message_agent", {"target": task["target"]})
                 if denied:
                     return json.dumps({"status": "blocked", "error": denied["message"]})
+                if action == "stop":
+                    # Set the race flag before waiting for an in-flight steer.
+                    # Marking the task cancelled happens only after we know a
+                    # live turn was actually interrupted.
+                    task["stop"].set()
+        if action == "wait":
+            turn = task.get("turn")
+            if turn is not None:
+                turn.done.wait(2)
         with task["lock"]:
             if action == "spawn":
                 context = contextvars.copy_context()
                 threading.Thread(target=context.run,
-                    args=(_start, task, target, text, timeout), daemon=True,
-                    name="bot-task-start-" + task["id"][:8]).start()
+                    args=(_start, task, target, text, mode, requested_session_id),
+                    daemon=True, name="bot-task-start-" + task["id"][:8]).start()
             else:
-                child = task["child"]
-                if child and child.closed and task["status"] == "running":
-                    task["status"] = child.outcome or "transport_closed_unknown"
+                _refresh(task)
                 if action == "stop":
-                    task["cancelled"] = True
-                    task["status"] = "stopped_unknown"
-                    if child:
-                        # Kill this dedicated child, including backend-owned pending
-                        # follow-ups. Do not race interrupt RPC against auto replay.
-                        child.close()
+                    turn = task.get("turn")
+                    if turn is None:
+                        if task["status"] == "starting":
+                            # No writer exists yet; cancel the pending launch.
+                            task["cancelled"] = True
+                            task["status"] = "stopped"
+                        else:
+                            # Startup already failed (for example a missing
+                            # session ID). Preserve that settled error.
+                            task["stop_status"] = "already_finished"
+                    elif turn.done.is_set() and not turn.interrupted:
+                        # Stop arrived after the turn had already settled. Do not
+                        # rewrite a completed/failed outcome as stopped.
+                        task["stop_status"] = "already_finished"
+                        task["status"] = turn.outcome or "failed"
+                    else:
+                        task["cancelled"] = True
+                        result = turn.interrupt()
+                        if result == "forced":
+                            task["status"] = "stopped_unknown"
+                            task["error"] = ("CLI turn required SIGKILL; persistence is "
+                                             "unknown and automatic resume is blocked.")
+                            task["next_step"] = ("Do not resume automatically; inspect the "
+                                                 "target session.")
+                        elif result == "graceful":
+                            task["status"] = "stopped"
+                            task["error"] = "Task was stopped; no automatic resume."
+                        else:
+                            _refresh(task)
+                        task["forced_kill"] = turn.forced
+                        task["interrupted"] = turn.interrupted
                 elif action == "steer":
-                    if not child or child.closed or task["status"] != "running":
-                        raise ValueError("task is not running")
-                    result = child.rpc("session.steer", {"session_id": child.sid, "text": text})
-                    return json.dumps({"task_id": task["id"], "status": "accepted_unconfirmed" if result.get("status") == "queued" else result.get("status", "unknown"),
-                        "backend_result": result, "active_turn_delivery_verified": False,
-                        "explanation": "Backend queued is ambiguous: live tool-result injection OR follow-up during compression. No automatic resend or fallback."})
-                elif action in ("status", "wait") and child and child.sid and not child.closed:
-                    if action == "wait":
-                        child.done.wait(2)
-                    state = child.rpc("session.activate", {"session_id": child.sid, "omit_messages": True})
-                    if child.done.is_set() and state.get("running") is False:
-                        task["status"] = "completed" if child.outcome == "completed" else "failed"
-                        # message.complete precedes backend post-turn follow-ups.
-                        # Keep the child alive: closing here can kill pending_steer
-                        # replay in the backend's turn-release window. Timer/stop
-                        # bounds its lifetime. Later status can observe another turn.
-                    elif state.get("running") is True:
-                        task["status"] = "running"
-                        child.done.clear()
+                    return json.dumps(_steer(task, domains, text), ensure_ascii=False)
+                elif action in ("status", "wait"):
+                    _refresh(task)
             return json.dumps(_snapshot(task), ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False)
@@ -287,9 +675,16 @@ def handle(domains, args, **kwargs):
 
 def shutdown():
     with _LOCK:
-        children = [t["child"] for t in _TASKS.values() if t["child"]]
-    for child in children:
-        child.close()
+        tasks = list(_TASKS.values())
+    # Publish cancellation to every task before waiting on any live turn. A
+    # pending initial launch or steer handoff observes this existing stop
+    # event and cannot install a replacement turn after shutdown begins.
+    for task in tasks:
+        task["stop"].set()
+    for task in tasks:
+        turn = task.get("turn")
+        if turn is not None and not turn.done.is_set():
+            turn.interrupt(grace=1.0, kill_grace=2.0)
 
 
 atexit.register(shutdown)
@@ -299,3 +694,7 @@ def register(ctx, domains):
     ctx.register_tool("bot_task", ask_bot.TOOLSET, SCHEMA,
         lambda args, **kw: handle(domains, args, **kw), check_fn=ask_bot.available,
         description="Manage parent-owned bot tasks", emoji="🧩")
+
+
+def register_prompt(ctx):
+    ctx.register_system_prompt_section("bot-acl.tasks", PROMPT, position="after_memory")

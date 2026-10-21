@@ -3,9 +3,7 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from test_consult import ConsultTests, consult
@@ -36,13 +34,13 @@ class HardeningTests(ConsultTests):
         self.assertFalse(transport[3])
         self.assertIn('done',transport[1])
 
-    def test_finite_and_zero_argv(self):
-        for seconds in (0,30,180,300):
-            result,run = self.call({**self.args,'timeout_seconds':seconds})
-            argv = run.call_args.args[0]
-            self.assertEqual(argv[argv.index('--run-budget')+1],str(seconds))
-            self.assertEqual(argv[argv.index('--max-turns')+1],'250')
-            self.assertEqual(result['status'],'completed')
+    def test_run_budget_is_always_zero(self):
+        result,run = self.call(self.args)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index('--run-budget')+1],'0')
+        self.assertEqual(argv[argv.index('--max-turns')+1],'250')
+        self.assertEqual(run.call_args.args[3],0)
+        self.assertEqual(result['status'],'completed')
 
     def test_audit_no_body_and_cancel(self):
         result,_ = self.call()
@@ -82,12 +80,14 @@ class HardeningTests(ConsultTests):
         schema,handler=registered['ask_bot']
         Draft202012Validator.check_schema(schema['parameters'])
         validator=Draft202012Validator(schema['parameters'])
+        self.assertNotIn('timeout_seconds', schema['parameters']['properties'])
         for timeout in (0,30,300):
-            validator.validate({**self.args,'timeout_seconds':timeout})
-        for timeout in (-1,1,29,301,True):
             self.assertTrue(list(validator.iter_errors({**self.args,'timeout_seconds':timeout})))
         with patch.object(consult,'_run',return_value=(0,self.output,'',False)),patch.object(consult.shutil,'which',return_value='/fixture/hermes'):
-            self.assertEqual(json.loads(handler({**self.args,'timeout_seconds':0}))['status'],'completed')
+            self.assertEqual(json.loads(handler(self.args))['status'],'completed')
+            rejected=json.loads(handler({**self.args,'timeout_seconds':0}))
+            self.assertEqual(rejected['status'],'failed')
+            self.assertIn('timeout_seconds is not supported',rejected['error'])
 
     def test_real_cancel_reaps_and_preserves_init_audit(self):
         original = subprocess.Popen
@@ -119,84 +119,8 @@ class HardeningTests(ConsultTests):
         self.assertEqual(record['cleanup'],'reaped')
         self.assertEqual(record['pid'],spawned[0].pid)
 
-    def test_installed_cli_budget_effect_without_model(self):
-        # Compile the installed public CLI implementation's small pure resolver;
-        # no private runtime dependency is added to the plugin.
-        import ast
-        source=Path('/home/shi/.hermes/hermes-agent/agent/agent_init.py').read_text()
-        node=next(n for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name=='_normalize_run_budget_seconds')
-        namespace={'Optional':__import__('typing').Optional}
-        exec(compile(ast.Module(body=[node],type_ignores=[]),'<installed-budget-resolver>','exec'),namespace)
-        self.assertIsNone(namespace[node.name](0))
-        self.assertEqual(namespace[node.name](30),30)
-        parser=Path('/home/shi/.hermes/hermes-agent/hermes_cli/_parser.py').read_text()
-        self.assertIn('Maximum tool-calling iterations',parser)
-        self.assertEqual(consult.MAX_TURNS,250)
-
-
-class NativeOwnershipTests(unittest.TestCase):
-    def test_live_parallel_sessions_busy_and_crash_recovery(self):
-        script = '''import sys,json
-from hermes_cli.active_sessions import try_acquire_active_session,release_active_session
-lease,error=try_acquire_active_session(session_id=sys.argv[2],surface=sys.argv[3],config={},registry_home=sys.argv[1])
-print(json.dumps({"started":lease is not None}),flush=True)
-if lease:
- sys.stdin.readline()
- release_active_session(lease)
-'''
-        with tempfile.TemporaryDirectory() as directory:
-            processes=[]
-            def start(sid,caller):
-                proc=subprocess.Popen([sys.executable,'-c',script,directory,sid,caller],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-                processes.append(proc)
-                import select
-                self.assertTrue(select.select([proc.stdout],[],[],5)[0])
-                result=json.loads(proc.stdout.readline())
-                return proc,result
-            try:
-                first,a=start('receiver-a','caller-one')
-                second,b=start('receiver-a','caller-two')
-                self.assertTrue(a['started'])
-                self.assertFalse(b['started'])
-                second.wait(timeout=5)
-                other,c=start('receiver-b','bot_task-fixture')
-                self.assertTrue(c['started'])
-                self.assertIsNone(first.poll())
-                self.assertIsNone(other.poll())
-                first.kill()
-                first.wait(timeout=5)
-                recovered,d=start('receiver-a','caller-three')
-                self.assertTrue(d['started'])
-            finally:
-                for proc in processes:
-                    if proc.poll() is None:
-                        proc.communicate(input='release\n',timeout=5)
-                    for stream in (proc.stdin,proc.stdout,proc.stderr):
-                        stream.close()
-
-    def test_process_exclusion_cross_caller_and_independent_sessions(self):
-        # Exercise installed ownership implementation in separate OS processes.
-        # This is a test-only import, NOT a plugin dependency or model invocation.
-        from hermes_cli.active_sessions import try_acquire_active_session, release_active_session
-        with tempfile.TemporaryDirectory() as directory:
-            lease,error=try_acquire_active_session(session_id='same',surface='bot_task-fixture',config={},registry_home=directory)
-            self.assertIsNone(error)
-            script='''import sys,json
-from hermes_cli.active_sessions import try_acquire_active_session,release_active_session
-lease,error=try_acquire_active_session(session_id=sys.argv[2],surface="cli",config={},registry_home=sys.argv[1])
-print(json.dumps({"started":lease is not None,"reason":str(getattr(error,"reason",""))}))
-if lease: release_active_session(lease)
-'''
-            def call(sid):
-                p=subprocess.run([sys.executable,'-c',script,directory,sid],capture_output=True,text=True,timeout=10)
-                self.assertEqual(p.returncode,0,p.stderr)
-                return json.loads(p.stdout)
-            try:
-                self.assertFalse(call('same')['started'])
-                self.assertTrue(call('different')['started'])
-            finally:
-                release_active_session(lease)
-            self.assertTrue(call('same')['started'])
+    def test_max_turns_is_250(self):
+        self.assertEqual(consult.MAX_TURNS, 250)
 
 
 if __name__=='__main__':

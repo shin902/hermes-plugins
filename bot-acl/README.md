@@ -16,34 +16,65 @@ Chat Completions `messages`, Responses `input`/`instructions`, and text-block co
 
 The permitted roster is frozen per profile/session/group configuration (bounded in-process cache) to avoid per-turn prefix drift. Reload the plugin or use a new session to refresh it after changing peers/profile availability. Sending checks remain live even when the displayed roster is frozen.
 
-## On-demand consultations (0.3.0)
+## Consultations and asynchronous bot tasks (0.7.0)
 
-The `bot_consult` toolset adds `list_bot_peers` and `ask_bot` to ordinary sessions. Enable it with `hermes -p <profile> tools enable bot_consult`; use a new session after enabling/reloading. Each call checks the existing ACL inside the handler, and the `pre_tool_call` guard also covers `ask_bot`.
+The `bot_consult` toolset adds `list_bot_peers`, `ask_bot`, and `bot_task` to ordinary sessions. Enable it with `hermes -p <profile> tools enable bot_consult`; use a new session after enabling/reloading. Each handler rechecks the live ACL; the `pre_tool_call` guard also covers `ask_bot` and `bot_task` spawn targets.
 
-`ask_bot` accepts `target`, `message`, optional `mode` (`new_session` by default, or `bot_chat`), and optional `timeout_seconds` (default **0 = no wall-clock limit**; finite values 30–300 seconds remain compatible). The agent selects the mode; there is no automatic retry or mode switch. `new_session` uses a fresh session in the recipient profile, without the canonical Bot Chat transcript. `bot_chat` resumes the existing `Bot Chat` by the public CLI title lookup; it does not create a look-alike chat when none exists. An exact CLI ownership-refusal marker returns `target_busy` plus guidance to use `new_session` if Bot Chat history is unnecessary.
+`ask_bot` is the synchronous one-shot consultation tool. It accepts `target`, `message`, and optional `mode` (`new_session` by default, or `resume` with an exact `session_id`). The reply is returned in the tool result. There is no `bot_chat` mode and no canonical Bot Chat lookup/continue behavior. Calls have no caller-selectable timeout: the runtime always uses `--run-budget 0` and `--max-turns 250`, with no wall-clock deadline. Supplying `timeout_seconds` is rejected explicitly, including `0`, rather than ignored. Nested consultations are disabled. No daemons, resident workers, queues, watchers, or callback loops are installed.
 
-Transport uses only public `hermes -p <target> chat --query-file - --format stream-json` with `--run-budget 0` for unlimited wall-clock time (explicitly overrides configured run budgets), or the finite timeout, and `--max-turns 250`. This is **250 agent iterations, not 250 individual tool calls**: one iteration may contain multiple calls. Installed delegate uses the same `max_iterations` budget. Payload is passed through stdin, and the recipient's terminal result is returned synchronously. No daemons, resident workers, queues, watchers, or callback loops are installed. Child consultation tools are disabled to prevent nested `ask_bot` loops. On timeout or interruption the owned, still-running process group is killed and the leader reaped. Timeout means outcome unknown, not guaranteed non-delivery; do not auto-resend. Recipient prompts explicitly prohibit background work and ask for a final reply rather than a separate message to the sender; this is not a sandbox for arbitrary recipient tools.
+`bot_task` actions are `spawn`, `list`, `status`, `wait`, `steer`, and `stop`. `spawn` requires `target` and `message` and accepts:
 
-A standard `register_system_prompt_section` adds fixed usage guidance to new session prompts. Peer discovery is a tool, not a global roster dump. Public CLI flags and JSON result format remain compatibility dependencies, but no private Hermes DM helpers, process registries, session-injection internals, or core patches are used.
+- `mode=new_session` (default): a fresh child session in the recipient profile.
+- `mode=resume` with an exact `session_id`: resume one stored session that already exists in the target profile. Titles, `latest`, aliases, and prefixes are rejected before a child starts; the exact ID is checked read-only in the selected profile before any CLI turn is launched.
 
-## Consultation hardening (0.5.0)
+There is no `bot_chat` mode and no canonical Bot Chat creation or continuation. `bot_task` has no `timeout_seconds` field and no wall-clock timer; supplying it is rejected explicitly, including `0`. `status`, `wait`, `stop`, and `steer` require `task_id`; `list` takes no extra fields. `status` and `wait` retrieve the current turn's reply or partial evidence. `stop` terminates the dedicated CLI process group. There is no automatic retry, mode switch, or resend.
 
-- Session evidence priority: valid terminal result ID, latest valid public `system/init` ID, then stderr footer. Init IDs are extracted incrementally (bounded parser) independently of the 512 KiB returned stdout tail. IDs are diagnostic identifiers, never an arbitrary-session access API. Timeout, cancellation and explicit partial results never become completed replies.
-- Minimal per-request audit records live at the **caller context-local** `get_hermes_home()/state/bot-acl/consult-audit/<request_id>.json`, atomically replaced with mode 0600. Records contain request ID, source implementation hash, child PID, start/end, target/mode, session ID or `unknown`, status and cleanup; never question/reply/stderr/environment. A process crash can leave `running`/`pending` and null end: these are not completion claims. Cleanup `reaped` describes the leader, not rollback or all external effects.
-- Concurrency uses the installed CLI ownership lease **after public title resolution to the actual receiver session**. It is process-shared and receiver-profile/session scoped, not caller/target wide. Distinct new sessions remain independent, different callers competing for the same Bot Chat conflict, and bot_task TUI sessions use the same ownership registry. Native leases handle stale/crashed owners and release on normal close; no extra plugin lock or private imports are introduced. The installed CLI has an unexpected-exception fail-open branch in `_claim_active_session`; this upstream limitation cannot be corrected by a session-exact plugin lease without a public receiver-ID resolution/reservation surface. Ordinary typed coordination failures remain refusals.
-- No arbitrary session-ID input, automatic retry, mode switch, service restart or existing-session schema refresh. Fresh CLI registry/doctor imports see the new code; already-running hosts/sessions may retain cached handlers.
+`steer` interrupts the active public CLI turn with `SIGTERM`, waits for the predecessor process group to exit, and then resumes the same returned `session_id` in the same target profile with only the new guidance. The original prompt is never resent. A completed turn cannot be steered: `steer` returns `not_applied_completed` and sends nothing. If shutdown requires a bounded `SIGKILL`, persistence is uncertain and automatic resume is blocked (`blocked_forced_kill`). If the interrupted turn returned no `session_id`, resume is also blocked (`blocked_no_session_id`). Stop sets a race flag before waiting for an in-flight steer, so a later steer cannot start a new writer; multiple steers are serialized by the task lock.
+
+### Transport
+
+Both tools use only the public CLI surface:
+
+```text
+hermes -p <target> chat --in <home> --query-file - --format stream-json \
+  --source <ask_bot|bot_task> --run-budget 0 --max-turns 250 [--resume=<exact-id>]
+```
+
+Each `bot_task` turn is one such subprocess. There is no TUI stdio JSON-RPC gateway, HTTP listener, shared gateway mutation, or arbitrary RPC passthrough. Target profile isolation uses `-p <target>`, `HERMES_HOME`, and removal of inherited TUI/profile/session environment variables. Child tasks are started asynchronously and are parent-owned; a parent can list only its own tasks, active-task limits are preserved, and the startup thread retains caller context. Nested child tasks are disabled. Transport failure, cancellation, and explicit partial results are never reported as completed replies.
+
+### Exact-ID resume blocker
+
+The public CLI does not expose a safe exact-ID existence check:
+
+- `chat --resume` accepts an exact ID, a title, or `latest`, and may follow a compression tip.
+- `hermes sessions export --session-id` accepts unique prefixes and materializes transcript data.
+- `hermes sessions list` is capped and has no exact-ID filter.
+
+The plugin therefore retains a read-only, parameterized `SELECT 1 FROM sessions WHERE id = ?` probe in the selected profile before resume. This is a documented internal storage dependency and the remaining upstream seam: a public CLI command that validates an exact stored session ID without accepting titles, prefixes, `latest`, or foreign profiles is still missing. The probe never widens accepted input; if the store is absent or unreadable, resume fails closed.
+
+## Consultation and task hardening (0.7.0)
+
+- A request for `resume` never creates a new session. Titles, `latest`, aliases, prefixes, and malformed IDs are rejected before launch; the exact stored ID is checked read-only in the target profile.
+- The verified parent `session_id` comes only from the tool runtime keyword arguments and owns the task record. `spawn.session_id` is accepted only for `mode=resume` and is the target-owned stored session.
+- The public CLI's typed ownership refusal (`hermes-refusal-reason: SESSION_NOT_OWNED`) becomes `target_busy` with no resend. Other startup failures become `failed_unknown`; synchronous `ask_bot` keeps its typed `target_busy` refusal and audit trail.
+- Neither tool accepts `timeout_seconds`; the key is rejected explicitly even when its value is `0`. `bot_task` creates no timer and no deadline, while `stop` still terminates and reaps the process group.
+- Synchronous `ask_bot` retains profile-local, atomic 0600 minimal request audits without question/reply bodies, bounded stream parsing, init/result/stderr session-ID evidence, process-group cleanup, and no automatic resend.
+- Retained task state is process-local and bounded. Stops are idempotent, cleanup failures do not replace an interruption, and `atexit` closes owned turns.
 
 ## Limits
 
 This is context hygiene, not secrecy or sandbox isolation. Earlier history can still contain bot names. The recognized heading/text format can change in Hermes releases, and host middleware failures are fail-open; retain the independent sending ACL. Unknown roster layout under the recognized heading is replaced conservatively and logged. A renamed heading or unsupported payload layout needs an update.
+
+The public `hermes chat --format stream-json` surface is shipped by the installed Hermes release, but this plugin has no separate stable third-party compatibility guarantee. Missing or changed flags fail closed without a fallback transport. A completed CLI process has exited, so its final result is final for that turn; interrupted and forced-kill outcomes are explicitly partial/unknown. The SQLite exact-ID probe depends on the installed `sessions.id` schema and is the documented blocker above. A live model-driven steer test is not performed; deterministic fake-CLI subprocess tests cover the protocol, and public `--help`/`sessions list` behavior is exercised in an isolated home.
 
 ## Verification
 
 Run with the Hermes runtime:
 
 ```sh
-hermes --run-module unittest discover -s /home/shi/.hermes/plugins/bot-acl -p 'test_*.py'
-hermes plugins doctor /home/shi/.hermes/plugins/bot-acl
+hermes --run-module unittest discover -s "$PWD/bot-acl" -p 'test_*.py'
+hermes plugins validate "$PWD/bot-acl"
+hermes plugins doctor "$PWD/bot-acl" --ci
 ```
 
 Keep each profile's existing `DOMAINS` unchanged when deploying the common `policy.py`/`roster.py` implementation. Some profiles share the entire plugin while others share only those implementation files.
