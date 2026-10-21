@@ -37,6 +37,22 @@ DEFAULT_TIMEOUT_SECONDS: Final = 900
 MAX_TIMEOUT_SECONDS: Final = 3600
 MAX_PROMPT_CHARS: Final = 100_000
 MAX_STDERR_CHARS: Final = 4_000
+MAX_TOOL_ERROR_CHARS: Final = 500
+_TOOL_FAILURE_STATES: Final = frozenset(
+    {
+        "error",
+        "failed",
+        "failure",
+        "denied",
+        "rejected",
+        "cancelled",
+        "canceled",
+        "permission_denied",
+        "timeout",
+        "timed_out",
+        "aborted",
+    }
+)
 DEFAULT_OPENCODE_BIN: Final = Path.home() / ".opencode" / "bin" / "opencode"
 _SESSION_ID_RE: Final = re.compile(r"^ses_[A-Za-z0-9]{1,120}$")
 
@@ -119,6 +135,38 @@ def validate_timeout(value: int) -> int:
     return value
 
 
+def _tool_state_failure(part: object) -> str:
+    """A tool part whose final state failed, or an empty string.
+
+    ``opencode run --format json`` emits ``{"type": "tool_use", "part": {...}}``
+    events. A denied permission is a tool part with ``state.status == "error"``
+    and a rejection message, even when the process exits 0.
+    """
+    if not isinstance(part, dict) or part.get("type") != "tool":
+        return ""
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return ""
+    status = state.get("status")
+    if not isinstance(status, str):
+        return ""
+    detail = state.get("error")
+    detail_text = detail if isinstance(detail, str) else ""
+    normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
+    denied = (
+        "permission denied" in detail_text.lower()
+        or "rejected permission" in detail_text.lower()
+    )
+    if normalized not in _TOOL_FAILURE_STATES and not denied:
+        return ""
+    tool = part.get("tool")
+    name = tool if isinstance(tool, str) and tool else "unknown"
+    message = f"tool {name} ended with state {status}"
+    if detail_text:
+        message += ": " + detail_text[:MAX_TOOL_ERROR_CHARS]
+    return message
+
+
 def parse_events(stdout: str) -> tuple[list[dict[str, Any]], str, str, list[str]]:
     """Read OpenCode's JSON-lines output into events, session id, text, errors.
 
@@ -142,10 +190,16 @@ def parse_events(stdout: str) -> tuple[list[dict[str, Any]], str, str, list[str]
             errors.append(f"line {number} is not a JSON object")
             continue
         events.append(event)
-        if event.get("type") in {"error", "session.error"}:
+        event_type = event.get("type")
+        event_type = event_type if isinstance(event_type, str) else ""
+        if event_type in {"error", "session.error"}:
             # The executor can report a provider or protocol failure as an
             # event and still exit 0. That is a failed turn, never a success.
             errors.append("output contains an error event")
+        elif event_type in {"tool_use", "tool"}:
+            failure = _tool_state_failure(event.get("part"))
+            if failure:
+                errors.append(failure)
         session_id = event.get("sessionID")
         if isinstance(session_id, str) and session_id:
             session_ids.append(session_id)

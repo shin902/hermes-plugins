@@ -205,6 +205,73 @@ class OpenCodeWorkerTests(unittest.TestCase):
         self.assertEqual(report["session_id"], "ses_error0001")
         self.assertIn("error event", report["error"])
 
+    def test_tool_state_error_with_zero_exit_is_a_failure(self):
+        fake = self.fake_script(
+            "fake_tool_error.py",
+            """
+            import json
+
+            print(json.dumps({"type": "step_start", "sessionID": "ses_toolerr01",
+                              "part": {"type": "step-start"}}))
+            print(json.dumps({"type": "tool_use", "sessionID": "ses_toolerr01",
+                              "part": {"type": "tool", "tool": "read",
+                                       "state": {"status": "error",
+                                                 "error": "The user rejected permission to use this specific tool call."}}}))
+            print(json.dumps({"type": "step_finish", "sessionID": "ses_toolerr01",
+                              "part": {"type": "step-finish", "reason": "tool-calls"}}))
+            """,
+        )
+
+        report = worker.run_worker(cwd=self.cwd, prompt="work", opencode_bin=fake)
+
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["opencode_exit_code"], 0)
+        self.assertEqual(report["session_id"], "ses_toolerr01")
+        self.assertIn("tool read ended with state error", report["error"])
+        self.assertIn("rejected permission", report["error"])
+
+    def test_tool_state_denied_with_zero_exit_is_a_failure(self):
+        fake = self.fake_script(
+            "fake_tool_denied.py",
+            """
+            import json
+
+            print(json.dumps({"type": "tool_use", "sessionID": "ses_tooldeny01",
+                              "part": {"type": "tool", "tool": "edit",
+                                       "state": {"status": "denied"}}}))
+            """,
+        )
+
+        report = worker.run_worker(cwd=self.cwd, prompt="edit", opencode_bin=fake)
+
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["opencode_exit_code"], 0)
+        self.assertEqual(report["session_id"], "ses_tooldeny01")
+        self.assertIn("tool edit ended with state denied", report["error"])
+
+    def test_successful_tool_state_does_not_fail_the_run(self):
+        fake = self.fake_script(
+            "fake_tool_success.py",
+            """
+            import json
+
+            print(json.dumps({"type": "tool_use", "sessionID": "ses_toolok01",
+                              "part": {"type": "tool", "tool": "read",
+                                       "state": {"status": "completed",
+                                                 "output": "ok"}}}))
+            print(json.dumps({"type": "text", "sessionID": "ses_toolok01",
+                              "part": {"type": "text", "text": "DONE"}}))
+            """,
+        )
+
+        report = worker.run_worker(cwd=self.cwd, prompt="read", opencode_bin=fake)
+
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["exit_code"], 0)
+        self.assertEqual(report["text"], "DONE")
+
     def test_invalid_json_output_is_a_protocol_failure(self):
         fake = self.fake_script("fake_not_json.py", 'print("not json")\n')
 

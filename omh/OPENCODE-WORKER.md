@@ -111,6 +111,9 @@ Example success shape:
 - Timeouts stop the private process group, set `timed_out: true`, and exit 124.
 - An executor `error` or `session.error` JSON event fails the run even when
   OpenCode exits 0; a reported failure is never a successful turn.
+- A `tool_use` part whose state is `error`, denied, rejected, or otherwise
+  failed also fails the run even when OpenCode exits 0. This covers a permission
+  denial that leaves OpenCode's exit code and stdout looking successful.
 - Invalid JSON, a missing session id, or a mismatched resumed session id is a
   protocol failure with exit 1.
 - Validation failures print a JSON error and exit 2.
