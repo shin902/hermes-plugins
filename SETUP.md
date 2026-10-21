@@ -5,14 +5,20 @@ Python 3.9+ standard library only; no network, plugin imports, config changes or
     python3 setup_profiles.py --home /home/shi/.hermes --dry-run
     python3 setup_profiles.py --home /home/shi/.hermes --apply
     python3 test_setup_profiles.py -v
+    python3 -m unittest discover -s omh -p 'test_decision_gate_tool.py' -v
+    python3 -m unittest discover -s omh -p 'test_opencode_worker.py' -v
+    python3 -m unittest discover -s omh -p 'test_worker_tool.py' -v
     hermes --run-module unittest discover -s . -p 'test_tool_modules.py' -v
+    hermes plugins validate ./omh
+    hermes plugins doctor ./omh --ci
 
 Dry-run is the default. --home overrides HERMES_HOME; --repo and --mapping are configurable.
 The schema_version 2 manifest explicitly maps each profile/plugin install to a
 repository-relative source and exact version. There are no pending or record-only
-entries. Existing correct links remain unchanged. Missing links are relative;
-existing real directories or divergent links are refused. Validation precedes all
-writes and partial link creation rolls back. Output is aggregate-only.
+entries. OMH is mapped only to the coding profile (omh version 4.0.0). Existing
+correct links remain unchanged. Missing links are relative; existing real
+directories or divergent links are refused. Validation precedes all writes and
+partial link creation rolls back. Output is aggregate-only.
 
 Each plugin has exactly one repository source: its plugin path at the root
 (including model-providers/opencode-acp). Every profile maps to that same path;

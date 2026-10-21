@@ -75,6 +75,12 @@
     },
     {
       "profile": "coding",
+      "plugin": "omh",
+      "source": "omh",
+      "version": "4.0.0"
+    },
+    {
+      "profile": "coding",
       "plugin": "orca-status",
       "source": "orca-status",
       "version": "1.0.0"
