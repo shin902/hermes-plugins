@@ -1,7 +1,9 @@
 """Parent-owned, bounded child tasks over the installed TUI stdio protocol.
 
-No HTTP listener, arbitrary RPC passthrough, resume, or caller-supplied session IDs.
-State is deliberately process-local and disappears with the owning process.
+No HTTP listener, arbitrary RPC passthrough, or caller-supplied runtime session
+IDs. A task may open a fresh child session or resume one exact target-owned
+stored session. State is deliberately process-local and disappears with the
+owning process.
 """
 import atexit
 import contextvars
@@ -9,49 +11,66 @@ import importlib.util
 import json
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
-import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 from . import ask_bot
 from .policy import check
 
+PROMPT = (
+    "Run parent-owned child bot tasks with bot_task from ordinary sessions. "
+    "Use list_bot_peers to discover allowed teammates. spawn requires target and "
+    "message. Choose mode=new_session for an isolated child (default) or "
+    "mode=resume with target and an exact target-owned session_id. bot_task never "
+    "substitutes another mode. There is no wall-clock timer. Use status or wait to "
+    "retrieve a result, steer with the understanding that delivery is ambiguous, "
+    "and stop to kill the child. There is no automatic retry, mode switch, or resend."
+)
 SCHEMA = {
     "name": "bot_task",
-    "description": "Run and control bounded same-group child bot tasks owned by this parent session. spawn requires target/message; status/stop/steer require task_id; list takes no extra fields. No arbitrary session access. steer reports ambiguous acceptance, never claims guaranteed active-turn delivery (backend may queue a follow-up during compression). Results are retrieved with status; no automatic notifications.",
+    "description": "Run and control same-group child bot tasks owned by this parent session. spawn requires target/message and chooses mode=new_session (default) or resume with an exact target-owned session_id. There is no wall-clock timer. status/wait/stop/steer require task_id; list takes no extra fields. Results are retrieved with status or wait; no automatic notifications. steer reports ambiguous acceptance, never claims guaranteed active-turn delivery. No automatic retry, mode switch, or resend.",
     "parameters": {"type": "object", "additionalProperties": False,
         "properties": {
             "action": {"type": "string", "enum": ["spawn", "list", "status", "wait", "steer", "stop"]},
-            "target": {"type": "string"}, "message": {"type": "string", "maxLength": 16000},
+            "target": {"type": "string"},
+            "message": {"type": "string", "maxLength": 16000},
             "task_id": {"type": "string"},
-            "timeout_seconds": {"type": "integer", "minimum": 30, "maximum": 600, "default": 300}},
+            "mode": {"type": "string", "enum": ["new_session", "resume"], "default": "new_session"},
+            "session_id": {"type": "string", "description": "Only with mode=resume: an exact stored session ID in the target profile."}},
         "required": ["action"]}}
 _LOCK = threading.RLock()
 _TASKS = {}
 
 
+class RPCError(RuntimeError):
+    def __init__(self, message, code=None, data=None):
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
+
 class Child:
-    def __init__(self, argv, env, cwd, timeout):
+    def __init__(self, argv, env, cwd):
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", env=env, cwd=cwd,
             start_new_session=True, bufsize=1)
         self.lock = threading.RLock()
         self.pending = {}
         self.sid = None
+        self.session_key = None
         self.reply = ""
+        self.error = None
         self.outcome = None
         self.closed = False
         self.ready = threading.Event()
         self.done = threading.Event()
-        self.deadline = time.monotonic() + timeout
-        self.timer = threading.Timer(timeout, self.expire)
-        self.timer.daemon = True
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
-        self.timer.start()
 
     def send(self, frame):
         with self.lock:
@@ -67,12 +86,16 @@ class Child:
             self.pending[key] = response
         try:
             self.send({"jsonrpc": "2.0", "id": key, "method": method, "params": params})
-            result = response.get(timeout=max(.01, min(30, self.deadline - time.monotonic())))
+            result = response.get(timeout=30)
             if "error" in result:
-                raise RuntimeError(str(result["error"]))
+                error = result["error"]
+                if isinstance(error, dict):
+                    raise RPCError(str(error.get("message") or error),
+                                   code=error.get("code"), data=error.get("data"))
+                raise RPCError(str(error))
             return result.get("result", {})
         except queue.Empty as exc:
-            raise RuntimeError("RPC timeout; processing outcome is unknown; do not resend") from exc
+            raise RPCError("RPC timeout; processing outcome is unknown; do not resend") from exc
         finally:
             with self.lock:
                 self.pending.pop(key, None)
@@ -96,11 +119,28 @@ class Child:
                     event = frame.get("params", {})
                     if event.get("type") == "gateway.ready":
                         self.ready.set()
+                    elif event.get("session_id") == self.sid and event.get("type") == "error":
+                        message = event.get("payload", {}).get("message")
+                        with self.lock:
+                            if message:
+                                self.error = str(message)
+                            if self.outcome is None:
+                                self.outcome = "failed"
+                        self.done.set()
                     elif event.get("session_id") == self.sid and event.get("type") == "message.complete":
                         payload = event.get("payload", {})
+                        status = payload.get("status")
                         with self.lock:
                             self.reply = str(payload.get("text", ""))[:32000]
-                            self.outcome = payload.get("status", "completed")
+                            if status == "complete":
+                                self.outcome = "completed"
+                                self.error = None
+                            elif status == "interrupted":
+                                self.outcome = "failed"
+                                self.error = "recipient turn was interrupted"
+                            else:
+                                self.outcome = "failed"
+                                self.error = str(payload.get("error") or payload.get("text") or "recipient turn failed")
                         self.done.set()
                 else:
                     with self.lock:
@@ -109,27 +149,21 @@ class Child:
                         waiter.put_nowait(frame)
         except Exception as exc:
             with self.lock:
-                self.outcome = "transport_failed: " + str(exc)
+                self.outcome = "failed"
+                self.error = "transport_failed: " + str(exc)
         finally:
             with self.lock:
                 for waiter in self.pending.values():
                     if waiter.empty():
-                        waiter.put_nowait({"error": "child transport exited; outcome unknown"})
+                        waiter.put_nowait({"error": {"message": "child transport exited; outcome unknown"}})
             self.ready.set()
             self.done.set()
-
-    def expire(self):
-        with self.lock:
-            if not self.closed:
-                self.outcome = "timeout_unknown"
-        self.close()
 
     def close(self):
         with self.lock:
             if self.closed:
                 return
             self.closed = True
-            self.timer.cancel()
         ask_bot._stop_group(self.proc)
         for stream in (self.proc.stdin, self.proc.stdout):
             try:
@@ -138,7 +172,34 @@ class Child:
                 pass
 
 
-def _start(task, target, text, timeout):
+def _ownership_refusal(exc):
+    if not isinstance(exc, RPCError):
+        return False
+    reason = exc.data.get("reason") if isinstance(exc.data, dict) else None
+    return exc.code in (4009, 4090) or reason == "SESSION_NOT_OWNED" or "SESSION_NOT_OWNED" in str(exc)
+
+
+def _target_session(root, target, session_id):
+    home = root if target == "default" else root / "profiles" / target
+    path = home / "state.db"
+    if not path.is_file():
+        return False
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+            return db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _open_session(child, mode, requested_session_id):
+    if mode == "new_session":
+        return child.rpc("session.create", {"source": "bot_task", "title": "Bot task",
+            "close_on_disconnect": True, "follow_profile_config": True})
+    return child.rpc("session.resume", {"session_id": requested_session_id,
+        "omit_messages": True, "close_on_disconnect": True})
+
+
+def _start(task, target, text, mode, requested_session_id):
     child = None
     try:
         _, root = ask_bot.identity()
@@ -154,26 +215,36 @@ def _start(task, target, text, timeout):
         with task["lock"]:
             if task.get("cancelled"):
                 return
-            child = Child([sys.executable, "-m", "tui_gateway.entry"], env, source, timeout)
+            child = Child([sys.executable, "-m", "tui_gateway.entry"], env, source)
             task["child"] = child
-        if not child.ready.wait(min(30, timeout)) or child.proc.poll() is not None:
+        if not child.ready.wait(30) or child.proc.poll() is not None:
             raise RuntimeError("child gateway did not become ready")
         child.rpc("client.capabilities", {"server_requests": True})
-        result = child.rpc("session.create", {"source": "bot_task", "title": "Bot task",
-            "close_on_disconnect": True, "follow_profile_config": True})
-        child.sid = result["session_id"]
-        if not isinstance(child.sid, str) or not child.sid:
-            raise RuntimeError("child returned invalid session ID")
+        result = _open_session(child, mode, requested_session_id)
+        child.sid = ask_bot._valid_id(result.get("session_id")) if isinstance(result, dict) else None
+        if not child.sid:
+            raise RuntimeError("child returned invalid runtime session ID")
+        child.session_key = ask_bot._valid_id(
+            result.get("stored_session_id") or result.get("resumed") or result.get("session_key")
+        ) or (requested_session_id if mode == "resume" else None)
+        with task["lock"]:
+            if task.get("cancelled"):
+                child.close()
+                return
+        child.rpc("prompt.submit", {"session_id": child.sid, "text": text})
         with task["lock"]:
             if task.get("cancelled"):
                 child.close()
                 return
             task["status"] = "running"
-        child.rpc("prompt.submit", {"session_id": child.sid, "text": text})
     except Exception as exc:
         with task["lock"]:
             if not task.get("cancelled"):
-                task.update(status="failed_unknown", error=str(exc))
+                if _ownership_refusal(exc):
+                    task.update(status="target_busy", error=str(exc),
+                                next_step="Report the recipient session as busy. Do not automatically retry, resend, or switch modes.")
+                else:
+                    task.update(status="failed_unknown", error=str(exc))
         if child:
             child.close()
 
@@ -187,13 +258,17 @@ def _owner(kwargs):
 
 def _snapshot(task):
     child = task["child"]
-    return {"task_id": task["id"], "target": task["target"], "status": task["status"],
+    return {"task_id": task["id"], "target": task["target"], "mode": task.get("mode", "new_session"),
+            "status": task["status"],
             "session_id": child.sid if child else None,
-            "reply": child.reply if child else "", "error": task.get("error"),
+            "stored_session_id": child.session_key if child else None,
+            "requested_session_id": task.get("requested_session_id"),
+            "reply": child.reply if child else "",
+            "error": (child.error if child and child.error else None) or task.get("error"),
+            "next_step": task.get("next_step"),
             "finality_verified": False,
             "pending_steer_replay": "backend-owned; no client resend; exact-once not observable via this protocol",
-            "restart_recovery": False,
-            "deadline_seconds": max(0, int(child.deadline - time.monotonic())) if child else 0}
+            "restart_recovery": False}
 
 
 def handle(domains, args, **kwargs):
@@ -201,8 +276,10 @@ def handle(domains, args, **kwargs):
         if os.environ.get(ask_bot.DEPTH_ENV) == "1":
             raise ValueError("nested child tasks are disabled")
         owner = _owner(kwargs)
+        if "timeout_seconds" in args:
+            raise ValueError("timeout_seconds is not supported; bot tasks are always unlimited")
         action = args.get("action")
-        allowed = {"spawn": {"action", "target", "message", "timeout_seconds"},
+        allowed = {"spawn": {"action", "target", "message", "mode", "session_id"},
                    "list": {"action"}, "status": {"action", "task_id"},
                    "wait": {"action", "task_id"},
                    "stop": {"action", "task_id"}, "steer": {"action", "task_id", "message"}}
@@ -212,17 +289,31 @@ def handle(domains, args, **kwargs):
             text = args.get("message")
             if not isinstance(text, str) or not text.strip() or len(text) > 16000:
                 raise ValueError("message must contain 1-16000 characters")
+        if action == "spawn":
+            mode = args.get("mode", "new_session")
+            if mode not in ("new_session", "resume"):
+                raise ValueError("mode must be new_session or resume")
+            requested_session_id = args.get("session_id")
+            if mode == "resume":
+                if not ask_bot._valid_id(requested_session_id) or requested_session_id.lower() == "latest":
+                    raise ValueError("resume requires an exact session_id, not a title or latest")
+            elif "session_id" in args:
+                raise ValueError("session_id is only allowed with mode=resume")
         with _LOCK:
             if action == "list":
                 return json.dumps({"tasks": [_snapshot(t) for t in _TASKS.values()
                     if t["owner"] == owner and check(domains, "message_agent", {"target": t["target"]}) is None]})
             if action == "spawn":
-                timeout = args.get("timeout_seconds", 300)
-                if isinstance(timeout, bool) or not isinstance(timeout, int) or not 30 <= timeout <= 600:
-                    raise ValueError("timeout_seconds must be an integer between 30 and 600")
                 denied = check(domains, "message_agent", args)
                 if denied:
                     return json.dumps({"status": "blocked", "error": denied["message"]})
+                # Normalize only after the live ACL has accepted the canonical target.
+                target = args["target"].strip().removeprefix("@")
+                target = "default" if target == "hermes" else target
+                if mode == "resume":
+                    _, root = ask_bot.identity()
+                    if not _target_session(root, target, requested_session_id):
+                        raise ValueError("session_id not found in the target profile")
                 active = [t for t in _TASKS.values() if t["status"] == "starting" or (t["child"] and not t["child"].closed)]
                 if len(active) >= 16 or sum(t["owner"] == owner for t in active) >= 4:
                     raise ValueError("active child task limit reached (4 per parent, 16 per process)")
@@ -230,9 +321,8 @@ def handle(domains, args, **kwargs):
                 completed = [k for k,t in _TASKS.items() if t["status"] != "starting" and (t["child"] is None or t["child"].closed)]
                 for key in completed[:-64]:
                     del _TASKS[key]
-                target = args["target"].strip().removeprefix("@")
-                target = "default" if target == "hermes" else target
                 task = {"id": uuid.uuid4().hex, "owner": owner, "target": target,
+                        "mode": mode, "requested_session_id": requested_session_id if mode == "resume" else None,
                         "status": "starting", "child": None, "lock": threading.RLock()}
                 _TASKS[task["id"]] = task
             else:
@@ -247,11 +337,11 @@ def handle(domains, args, **kwargs):
             if action == "spawn":
                 context = contextvars.copy_context()
                 threading.Thread(target=context.run,
-                    args=(_start, task, target, text, timeout), daemon=True,
+                    args=(_start, task, target, text, mode, requested_session_id), daemon=True,
                     name="bot-task-start-" + task["id"][:8]).start()
             else:
                 child = task["child"]
-                if child and child.closed and task["status"] == "running":
+                if child and child.closed and task["status"] in ("running", "starting"):
                     task["status"] = child.outcome or "transport_closed_unknown"
                 if action == "stop":
                     task["cancelled"] = True
@@ -272,7 +362,7 @@ def handle(domains, args, **kwargs):
                         child.done.wait(2)
                     state = child.rpc("session.activate", {"session_id": child.sid, "omit_messages": True})
                     if child.done.is_set() and state.get("running") is False:
-                        task["status"] = "completed" if child.outcome == "completed" else "failed"
+                        task["status"] = child.outcome or "failed"
                         # message.complete precedes backend post-turn follow-ups.
                         # Keep the child alive: closing here can kill pending_steer
                         # replay in the backend's turn-release window. Timer/stop
@@ -299,3 +389,7 @@ def register(ctx, domains):
     ctx.register_tool("bot_task", ask_bot.TOOLSET, SCHEMA,
         lambda args, **kw: handle(domains, args, **kw), check_fn=ask_bot.available,
         description="Manage parent-owned bot tasks", emoji="🧩")
+
+
+def register_prompt(ctx):
+    ctx.register_system_prompt_section("bot-acl.tasks", PROMPT, position="after_memory")

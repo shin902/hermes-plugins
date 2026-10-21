@@ -6,7 +6,7 @@ from .ask_bot import TOOLSET, available, identity
 
 SCHEMA = {
     "name": "list_bot_peers",
-    "description": "List canonical local bot IDs allowed by this sender's current bot-acl group. Does not start agents or send messages.",
+    "description": "List canonical local bot IDs allowed by this sender's current bot-acl group, plus the consultation/task modes new_session and resume. Does not start agents or send messages.",
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
@@ -19,7 +19,7 @@ def list_peers(domains, args, **kwargs):
         peers = [name for name in sorted(candidates) if name != source
                  and check(domains, "message_agent", {"target": name}) is None]
         return json.dumps({"source": source, "peers": peers,
-                           "modes": ["new_session", "bot_chat", "resume"]}, ensure_ascii=False)
+                           "modes": ["new_session", "resume"]}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False)
 

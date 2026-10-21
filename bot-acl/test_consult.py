@@ -61,15 +61,15 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(env['HERMES_HOME'],str(self.root/'profiles/mail'))
         self.assertEqual(env[consult.DEPTH_ENV],'1')
         self.assertEqual(timeout,0)
+        self.assertEqual(argv[argv.index('--run-budget')+1], '0')
         self.assertEqual(argv[argv.index('--max-turns')+1], '250')
         self.assertEqual(scratch,self.root/'profiles/coding/cache/scratch')
 
-    def test_bot_chat_resume_without_creation(self):
-        result,run=self.call({**self.args,'mode':'bot_chat'})
-        argv=run.call_args.args[0]
-        self.assertEqual(argv[-2:],['--continue','Bot Chat'])
-        self.assertNotIn('--create-if-missing',argv)
-        self.assertEqual(result['mode'],'bot_chat')
+    def test_bot_chat_mode_is_rejected_before_launch(self):
+        result, run = self.call({**self.args, 'mode': 'bot_chat'})
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('mode must be new_session or resume', result['error'])
+        run.assert_not_called()
 
     def recipient_session(self, target='mail', sid='test-recipient'):
         home = self.root if target == 'default' else self.root / 'profiles' / target
@@ -124,7 +124,7 @@ class ConsultTests(unittest.TestCase):
             self.assertEqual(result['status'], status)
             self.assertEqual(result['session_id'], sid)
             run.assert_called_once()
-        with consult._receiver_lock(self.root, 'mail', 'resume', sid):
+        with consult._receiver_lock(self.root, 'mail', sid):
             result, run = self.call(args)
             self.assertEqual(result['status'], 'target_busy')
             run.assert_not_called()
@@ -135,9 +135,13 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
 
     def test_resume_discovery(self):
-        self.assertIn('resume', consult.ASK_SCHEMA['parameters']['properties']['mode']['enum'])
+        modes = consult.ASK_SCHEMA['parameters']['properties']['mode']['enum']
+        self.assertEqual(modes, ['new_session', 'resume'])
+        self.assertNotIn('bot_chat', modes)
+        self.assertNotIn('timeout_seconds', consult.ASK_SCHEMA['parameters']['properties'])
         self.assertIn('session_id', consult.ASK_SCHEMA['parameters']['properties'])
-        self.assertIn('resume', json.loads(peers.list_peers(self.domains, {}))['modes'])
+        self.assertEqual(json.loads(peers.list_peers(self.domains, {}))['modes'],
+                         ['new_session', 'resume'])
 
     def test_alias_default_and_at_id(self):
         for name,canonical in [('@mail','mail'),('hermes','default')]:
@@ -170,15 +174,22 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(listing['source'],'coding')
 
     def test_invalid_parameters(self):
-        for extra in ({'mode':'unknown'},{'message':''},{'message':'x'*16001},{'timeout_seconds':True},{'timeout_seconds':29},{'timeout_seconds':301}):
+        for extra in ({'mode':'unknown'},{'message':''},{'message':'x'*16001}):
             result,run=self.call({**self.args,**extra})
             self.assertEqual(result['status'],'failed')
             run.assert_not_called()
 
+    def test_timeout_seconds_is_explicitly_rejected(self):
+        for timeout in (0, 30, 300, -1, True, 1.5, None):
+            result, run = self.call({**self.args, 'timeout_seconds': timeout})
+            self.assertEqual(result['status'], 'failed', timeout)
+            self.assertIn('timeout_seconds is not supported', result['error'])
+            run.assert_not_called()
+
     def test_busy_gives_guidance_without_auto_retry(self):
-        result,run=self.call({**self.args,'mode':'bot_chat'},(1,'','hermes-refusal-reason: SESSION_NOT_OWNED\n',False))
+        result,run=self.call(self.args,(1,'','hermes-refusal-reason: SESSION_NOT_OWNED\n',False))
         self.assertEqual(result['status'],'target_busy')
-        self.assertIn('mode=new_session',result['next_step'])
+        self.assertIn('Do not automatically retry',result['next_step'])
         run.assert_called_once()
 
     def test_model_text_does_not_fake_busy(self):

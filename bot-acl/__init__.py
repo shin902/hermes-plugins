@@ -6,6 +6,7 @@ from .ask_bot import register as register_ask_bot
 from .ask_bot import register_prompt as register_consult_prompt
 from .list_bot_peers import register as register_list_bot_peers
 from .bot_task import register as register_bot_task
+from .bot_task import register_prompt as register_task_prompt
 
 DOMAINS = {
     "main": {"default", "coding", "computer-use", "meta-bot"},
@@ -14,6 +15,10 @@ DOMAINS = {
 
 
 def check_bot_acl(tool_name, args, **kwargs):
+    if tool_name == "bot_task":
+        if (args or {}).get("action") != "spawn":
+            return None
+        return check(DOMAINS, "message_agent", args, **kwargs)
     return check(DOMAINS, "message_agent" if tool_name == "ask_bot" else tool_name, args, **kwargs)
 
 
@@ -25,6 +30,7 @@ def register(ctx):
     register_ask_bot(ctx, DOMAINS)
     register_list_bot_peers(ctx, DOMAINS)
     register_consult_prompt(ctx)
+    register_task_prompt(ctx)
     register_bot_task(ctx, DOMAINS)
     ctx.register_hook("pre_tool_call", check_bot_acl)
     ctx.register_middleware("llm_request", filter_bot_roster)

@@ -8,13 +8,15 @@ from unittest.mock import patch, Mock
 from test_acl import acl
 
 tasks = sys.modules[acl.__name__ + '.bot_task']
+consult = sys.modules[acl.__name__ + '.ask_bot']
 
 class TaskTests(unittest.TestCase):
     def setUp(self):
         self.saved = tasks._TASKS.copy()
         tasks._TASKS.clear()
         self.addCleanup(lambda: (tasks._TASKS.clear(), tasks._TASKS.update(self.saved)))
-        self.child = Mock(closed=False, sid='child-only', reply='result', deadline=time.monotonic()+30, outcome='completed')
+        self.child = Mock(closed=False, sid='child-only', session_key='stored-only', error=None,
+                          reply='result', outcome='completed')
         self.child.done = threading.Event()
         tasks._TASKS['t'] = {'id':'t', 'owner':('/parent', 'parent'), 'target':'coding', 'child':self.child, 'status':'running', 'lock':threading.RLock()}
         self.home = patch.object(tasks.ask_bot, 'get_hermes_home', return_value='/parent')
@@ -76,3 +78,28 @@ class TaskTests(unittest.TestCase):
         ctx=Mock()
         tasks.register(ctx,{})
         self.assertEqual(ctx.register_tool.call_args.args[:3],('bot_task','bot_consult',tasks.SCHEMA))
+
+    def test_plugin_exposes_sync_and_async_tools(self):
+        from pathlib import Path
+        ctx = Mock()
+        acl.register(ctx)
+        names = [call.args[0] for call in ctx.register_tool.call_args_list]
+        self.assertEqual(names, ['ask_bot', 'list_bot_peers', 'bot_task'])
+        manifest = Path(__file__).with_name('plugin.yaml').read_text()
+        self.assertIn('ask_bot', manifest)
+        self.assertTrue(callable(consult.register))
+        self.assertEqual(consult.ASK_SCHEMA['name'], 'ask_bot')
+
+    def test_prompts_guide_both_tools_without_bot_chat(self):
+        import tempfile
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PluginManager(directory)
+            ctx = PluginContext(PluginManifest(name='bot-acl'), manager)
+            consult.register_prompt(ctx)
+            tasks.register_prompt(ctx)
+            sections = manager.render_system_prompt_sections({'session_id': 'ordinary', 'title': 'ordinary'})
+        text = '\n'.join(section.content for section in sections)
+        self.assertIn('ask_bot', text)
+        self.assertIn('bot_task', text)
+        self.assertNotIn('bot_chat', text)

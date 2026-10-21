@@ -28,11 +28,13 @@ class AsyncTests(TaskTests):
         tasks._TASKS['t']['child'] = None
         self.assertEqual(self.call('stop', task_id='t')['status'], 'stopped_unknown')
         with patch.object(tasks, 'Child') as ctor:
-            tasks._start(tasks._TASKS['t'], 'coding', 'do not run', 30)
+            tasks._start(tasks._TASKS['t'], 'coding', 'do not run', 'new_session', None)
             ctor.assert_not_called()
 
     def test_wait_registered_and_handled(self):
         self.assertIn('wait', tasks.SCHEMA['parameters']['properties']['action']['enum'])
+        self.assertIn('status/wait/stop/steer require task_id', tasks.SCHEMA['description'])
+        self.assertNotIn('list and wait take no extra fields', tasks.SCHEMA['description'])
         self.child.done.set()
         self.child.rpc.return_value = {'running':False}
         self.assertEqual(self.call('wait', task_id='t')['status'], 'completed')
@@ -45,8 +47,19 @@ class AsyncTests(TaskTests):
         payload = {'action':'list'}
         jsonschema.validate(payload, tasks.SCHEMA['parameters'])
         self.assertIn('tasks', json.loads(callback(payload, session_id='parent')))
+        jsonschema.validate({'action':'spawn','message':'hello','target':'coding','mode':'resume',
+                             'session_id':'target-session'}, tasks.SCHEMA['parameters'])
         with self.assertRaises(jsonschema.ValidationError):
-            jsonschema.validate({'action':'spawn','session_id':'forbidden'}, tasks.SCHEMA['parameters'])
+            jsonschema.validate({'action':'spawn','unknown':'forbidden'}, tasks.SCHEMA['parameters'])
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate({'action':'spawn','message':'hello','target':'coding',
+                                 'timeout_seconds':0}, tasks.SCHEMA['parameters'])
+        rejected = self.call('spawn', target='coding', message='hello', timeout_seconds=0)
+        self.assertEqual(rejected['status'], 'failed')
+        self.assertIn('timeout_seconds is not supported', rejected['error'])
+        rejected = self.call('list', timeout_seconds=0)
+        self.assertEqual(rejected['status'], 'failed')
+        self.assertIn('timeout_seconds is not supported', rejected['error'])
 
 
 class OfficialTransportSmoke(unittest.TestCase):
@@ -62,7 +75,7 @@ class OfficialTransportSmoke(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             env = dict(os.environ, HERMES_HOME=home, PYTHONPATH=source)
             env.pop('HERMES_TUI_ATTACH_URL', None)
-            child = tasks.Child([sys.executable,'-m','tui_gateway.entry'], env, source, 30)
+            child = tasks.Child([sys.executable,'-m','tui_gateway.entry'], env, source)
             try:
                 self.assertTrue(child.ready.wait(20))
                 self.assertIsNone(child.proc.poll())

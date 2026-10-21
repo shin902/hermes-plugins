@@ -36,13 +36,13 @@ class HardeningTests(ConsultTests):
         self.assertFalse(transport[3])
         self.assertIn('done',transport[1])
 
-    def test_finite_and_zero_argv(self):
-        for seconds in (0,30,180,300):
-            result,run = self.call({**self.args,'timeout_seconds':seconds})
-            argv = run.call_args.args[0]
-            self.assertEqual(argv[argv.index('--run-budget')+1],str(seconds))
-            self.assertEqual(argv[argv.index('--max-turns')+1],'250')
-            self.assertEqual(result['status'],'completed')
+    def test_run_budget_is_always_zero(self):
+        result,run = self.call(self.args)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index('--run-budget')+1],'0')
+        self.assertEqual(argv[argv.index('--max-turns')+1],'250')
+        self.assertEqual(run.call_args.args[3],0)
+        self.assertEqual(result['status'],'completed')
 
     def test_audit_no_body_and_cancel(self):
         result,_ = self.call()
@@ -82,12 +82,14 @@ class HardeningTests(ConsultTests):
         schema,handler=registered['ask_bot']
         Draft202012Validator.check_schema(schema['parameters'])
         validator=Draft202012Validator(schema['parameters'])
+        self.assertNotIn('timeout_seconds', schema['parameters']['properties'])
         for timeout in (0,30,300):
-            validator.validate({**self.args,'timeout_seconds':timeout})
-        for timeout in (-1,1,29,301,True):
             self.assertTrue(list(validator.iter_errors({**self.args,'timeout_seconds':timeout})))
         with patch.object(consult,'_run',return_value=(0,self.output,'',False)),patch.object(consult.shutil,'which',return_value='/fixture/hermes'):
-            self.assertEqual(json.loads(handler({**self.args,'timeout_seconds':0}))['status'],'completed')
+            self.assertEqual(json.loads(handler(self.args))['status'],'completed')
+            rejected=json.loads(handler({**self.args,'timeout_seconds':0}))
+            self.assertEqual(rejected['status'],'failed')
+            self.assertIn('timeout_seconds is not supported',rejected['error'])
 
     def test_real_cancel_reaps_and_preserves_init_audit(self):
         original = subprocess.Popen
