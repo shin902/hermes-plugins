@@ -1,115 +1,157 @@
-"""Protocol support for exact target-session resumption and process-shared ownership; no model calls."""
+"""Deterministic public-CLI subprocess integration and public CLI surface checks.
+
+No model is invoked. The fake executable is a local Python script; the public
+CLI checks only run ``--help`` and an empty ``sessions list`` against a
+temporary HERMES_HOME.
+"""
+import ast
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from test_acl import acl
+from _task_fixtures import make_fake_cli, read_events
 
 tasks = sys.modules[acl.__name__ + '.bot_task']
 
 
-class GatewayProtocolSmoke(unittest.TestCase):
-    def test_create_seeded_sessions_and_resume_in_one_process(self):
-        import importlib.util
-        spec = importlib.util.find_spec('tui_gateway')
-        source = str(Path(spec.origin).parent.parent)
+class TurnIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.cli = make_fake_cli(self.root)
+        self.log = self.root / 'events.log'
+        self.env = dict(os.environ, FAKE_CLI_LOG=str(self.log),
+                        HERMES_HOME=str(self.root))
+        self.env.pop('FAKE_CLI_MODE', None)
+        self.env.pop('FAKE_CLI_NO_SESSION_ID', None)
+        self.env.pop('FAKE_CLI_OWNERSHIP_REFUSAL', None)
+
+    def turn(self, mode='complete', payload='literal $(false)', **env):
+        child_env = dict(self.env, FAKE_CLI_MODE=mode, **env)
+        argv = [str(self.cli), '-p', 'mail', 'chat', '--query-file', '-',
+                '--format', 'stream-json', '--run-budget', '0', '--max-turns', '250']
+        return tasks.Turn(argv, payload, child_env, Path.home(), self.root,
+                          'mail', 'new_session')
+
+    def test_complete_turn_parses_init_and_result(self):
+        turn = self.turn()
+        self.assertTrue(turn.done.wait(8))
+        self.assertEqual(turn.outcome, 'completed')
+        self.assertEqual(turn.session_id, '20260101_000000_abcdef')
+        self.assertIn('literal $(false)', turn.reply)
+        self.assertFalse(turn.forced)
+
+    def test_graceful_interrupt_preserves_partial_and_session(self):
+        turn = self.turn('graceful')
+        self.assertTrue(turn.started.wait(5))
+        deadline = time.monotonic() + 5
+        while turn.session_id is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(turn.interrupt(), 'graceful')
+        self.assertEqual(turn.outcome, 'interrupted')
+        self.assertEqual(turn.session_id, '20260101_000000_abcdef')
+        self.assertEqual(turn.partial_reply, 'interrupted partial')
+        self.assertFalse(turn.forced)
+
+    def test_forced_kill_marks_persistence_unknown(self):
+        with patch.object(tasks, 'SHUTDOWN_GRACE', .2), patch.object(tasks, 'KILL_GRACE', 1.0):
+            turn = self.turn('ignore')
+            self.assertTrue(turn.started.wait(5))
+            deadline = time.monotonic() + 5
+            while turn.session_id is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(turn.interrupt(), 'forced')
+        self.assertEqual(turn.outcome, 'forced_stop_unknown')
+        self.assertTrue(turn.forced)
+        self.assertIn('SIGKILL', turn.error)
+
+    def test_missing_session_id_is_not_invented(self):
+        turn = self.turn('complete', FAKE_CLI_NO_SESSION_ID='1')
+        self.assertTrue(turn.done.wait(8))
+        self.assertIsNone(turn.session_id)
+
+    def test_tool_child_is_terminated_with_the_group(self):
+        turn = self.turn('tool')
+        self.assertTrue(turn.started.wait(5))
+        deadline = time.monotonic() + 5
+        while not any(event['event'] == 'tool' for event in read_events(self.log)):
+            if time.monotonic() > deadline:
+                self.fail('tool child did not start')
+            time.sleep(.01)
+        tool = next(event for event in read_events(self.log) if event['event'] == 'tool')
+        self.assertEqual(turn.interrupt(), 'graceful')
+        self.assertTrue(turn.done.wait(5))
+        deadline = time.monotonic() + 5
+        while self.alive(tool['pid']):
+            if time.monotonic() > deadline:
+                self.fail('tool child survived the process-group SIGTERM')
+            time.sleep(.01)
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+class PublicCliSurfaceTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('hermes'), 'public hermes CLI is installed')
+    def test_chat_help_exposes_required_public_flags(self):
         with tempfile.TemporaryDirectory() as home:
-            env = dict(os.environ, HERMES_HOME=home, PYTHONPATH=source)
-            env.pop('HERMES_TUI_ATTACH_URL', None)
-            child = tasks.Child([sys.executable, '-m', 'tui_gateway.entry'], env, source)
-            try:
-                self.assertTrue(child.ready.wait(20))
-                child.rpc('client.capabilities', {'server_requests': True})
-                first = child.rpc('session.create', {
-                    'source': 'bot_task', 'title': 'First stored task', 'close_on_disconnect': True,
-                    'messages': [{'role': 'user', 'content': 'seed one'}]})
-                second = child.rpc('session.create', {
-                    'source': 'bot_task', 'title': 'Second task', 'close_on_disconnect': True,
-                    'messages': [{'role': 'user', 'content': 'seed two'}]})
-                self.assertNotEqual(first['session_id'], second['session_id'])
-                listed = child.rpc('session.list', {'title': 'First stored task'})
-                rows = listed['sessions']
-                self.assertEqual(len(rows), 1)
-                stored = rows[0].get('resolved_id') or rows[0]['id']
-                self.assertEqual(stored, first['stored_session_id'])
-                resumed = child.rpc('session.resume', {
-                    'session_id': stored, 'omit_messages': True, 'close_on_disconnect': True})
-                self.assertEqual(resumed.get('resumed') or resumed.get('session_key'), stored)
-                active = child.rpc('session.active_list', {})
-                ids = {row['id'] for row in active['sessions']}
-                self.assertIn(resumed['session_id'], ids)
-                self.assertIn(second['session_id'], ids)
-            finally:
-                child.close()
+            env = dict(os.environ, HERMES_HOME=home)
+            result = subprocess.run([shutil.which('hermes'), 'chat', '--help'],
+                                    capture_output=True, text=True, timeout=30,
+                                    env=env, cwd=home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for flag in ('--query-file', '--format', 'stream-json', '--run-budget',
+                     '--max-turns', '--resume'):
+            self.assertIn(flag, result.stdout)
+
+    @unittest.skipUnless(shutil.which('hermes'), 'public hermes CLI is installed')
+    def test_sessions_list_works_in_isolated_home(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ, HERMES_HOME=home)
+            result = subprocess.run([shutil.which('hermes'), 'sessions', 'list', '--limit', '1'],
+                                    capture_output=True, text=True, timeout=30,
+                                    env=env, cwd=home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('No sessions found', result.stdout)
 
 
-class NativeOwnershipTests(unittest.TestCase):
-    def test_live_parallel_sessions_busy_and_crash_recovery(self):
-        script = '''import sys,json
-from hermes_cli.active_sessions import try_acquire_active_session,release_active_session
-lease,error=try_acquire_active_session(session_id=sys.argv[2],surface=sys.argv[3],config={},registry_home=sys.argv[1])
-print(json.dumps({"started":lease is not None}),flush=True)
-if lease:
- sys.stdin.readline()
- release_active_session(lease)
-'''
-        with tempfile.TemporaryDirectory() as directory:
-            processes=[]
-            def start(sid,caller):
-                proc=subprocess.Popen([sys.executable,'-c',script,directory,sid,caller],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-                processes.append(proc)
-                import select
-                self.assertTrue(select.select([proc.stdout],[],[],5)[0])
-                result=json.loads(proc.stdout.readline())
-                return proc,result
-            try:
-                first,a=start('receiver-a','caller-one')
-                second,b=start('receiver-a','caller-two')
-                self.assertTrue(a['started'])
-                self.assertFalse(b['started'])
-                second.wait(timeout=5)
-                other,c=start('receiver-b','bot_task-fixture')
-                self.assertTrue(c['started'])
-                self.assertIsNone(first.poll())
-                self.assertIsNone(other.poll())
-                first.kill()
-                first.wait(timeout=5)
-                recovered,d=start('receiver-a','caller-three')
-                self.assertTrue(d['started'])
-            finally:
-                for proc in processes:
-                    if proc.poll() is None:
-                        proc.communicate(input='release\n',timeout=5)
-                    for stream in (proc.stdin,proc.stdout,proc.stderr):
-                        stream.close()
+class NoPrivateTransportTests(unittest.TestCase):
+    FORBIDDEN = {'tui_gateway', 'hermes_cli.active_sessions', 'hermes_state_sessions'}
 
-    def test_process_exclusion_cross_caller_and_independent_sessions(self):
-        # Exercise installed ownership implementation in separate OS processes.
-        # This is a test-only import, NOT a plugin dependency or model invocation.
-        from hermes_cli.active_sessions import try_acquire_active_session, release_active_session
-        with tempfile.TemporaryDirectory() as directory:
-            lease,error=try_acquire_active_session(session_id='same',surface='bot_task-fixture',config={},registry_home=directory)
-            self.assertIsNone(error)
-            script='''import sys,json
-from hermes_cli.active_sessions import try_acquire_active_session,release_active_session
-lease,error=try_acquire_active_session(session_id=sys.argv[2],surface="cli",config={},registry_home=sys.argv[1])
-print(json.dumps({"started":lease is not None,"reason":str(getattr(error,"reason",""))}))
-if lease: release_active_session(lease)
-'''
-            def call(sid):
-                p=subprocess.run([sys.executable,'-c',script,directory,sid],capture_output=True,text=True,timeout=10)
-                self.assertEqual(p.returncode,0,p.stderr)
-                return json.loads(p.stdout)
-            try:
-                self.assertFalse(call('same')['started'])
-                self.assertTrue(call('different')['started'])
-            finally:
-                release_active_session(lease)
-            self.assertTrue(call('same')['started'])
+    def test_runtime_and_tests_have_no_forbidden_private_imports(self):
+        for path in Path(__file__).parent.glob('*.py'):
+            tree = ast.parse(path.read_text(encoding='utf-8'))
+            for node in ast.walk(tree):
+                modules = []
+                if isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    modules = [node.module]
+                for module in modules:
+                    for forbidden in self.FORBIDDEN:
+                        self.assertFalse(module == forbidden or module.startswith(forbidden + '.'),
+                                         f'{path.name} imports {module}')
+
+    def test_runtime_has_no_tui_protocol_strings(self):
+        for name in ('bot_task.py', 'ask_bot.py'):
+            text = Path(__file__).with_name(name).read_text(encoding='utf-8')
+            for marker in ('tui_gateway', 'session.resume', 'prompt.submit',
+                           'message.complete', 'session.steer', 'session.activate'):
+                self.assertNotIn(marker, text, f'{name} contains {marker}')
 
 
 if __name__ == '__main__':

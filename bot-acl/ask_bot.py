@@ -101,7 +101,11 @@ ASK_SCHEMA = {
 
 
 def available():
-    return os.environ.get(DEPTH_ENV) != "1" and shutil.which("hermes") is not None
+    return os.environ.get(DEPTH_ENV) != "1" and _executable() is not None
+
+
+def _executable():
+    return shutil.which("hermes")
 
 
 def identity():
@@ -109,17 +113,87 @@ def identity():
     return (home.name, home.parent.parent) if home.parent.name == "profiles" else ("default", home)
 
 
-def _stop_group(proc):
+def _target_home(root, target):
+    return Path(root) if target == "default" else Path(root) / "profiles" / target
+
+
+def _require_exact_session_id(target_home, session_id):
+    """Validate an exact stored session ID in the selected profile.
+
+    Public CLI resume is not an exact-ID check: ``--resume`` also accepts
+    ``latest`` and titles, and ``hermes sessions export --session-id`` accepts
+    unique prefixes and materializes the transcript. Neither surface can prove
+    exact-ID existence without widening the accepted input. This read-only,
+    parameterized probe is therefore retained as a documented internal
+    dependency; it never selects a title, prefix, or another profile.
+    """
+    path = Path(target_home) / "state.db"
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+            if not db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
+                raise ValueError("session_id not found in target profile")
+    except sqlite3.Error as exc:
+        raise ValueError("session_id not found in target profile") from exc
+
+
+def _child_env(target_home):
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(target_home)
+    env[DEPTH_ENV] = "1"
+    for name in ("HERMES_TUI_ATTACH_URL", "HERMES_TUI_SIDECAR_URL", "HERMES_PROFILE", "HERMES_SESSION_ID"):
+        env.pop(name, None)
+    scratch = Path(get_hermes_home()) / "cache" / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(scratch)
+    return env, scratch
+
+
+def _cli_argv(executable, target, mode, session_id, source):
+    argv = [executable, "-p", target, "chat", "--in", str(Path.home()),
+            "--query-file", "-", "--format", "stream-json", "--source", source,
+            "--run-budget", "0", "--max-turns", str(MAX_TURNS)]
+    if mode == "resume":
+        argv += ["--resume=" + session_id]
+    return argv
+
+
+def _payload(source, message, task=False, steer=False):
+    if steer:
+        lead = (f"New guidance from @{source} for this parent-owned task. Apply it in your "
+                "final answer. This is a bounded one-shot turn, not a resident worker. "
+                "Do not launch background agents, daemons, watchers, or polling loops. "
+                "Do not message the sender separately; your final answer is returned to them.")
+    elif task:
+        lead = (f"Task from @{source}. Reply to this request in your final answer. "
+                "This is a bounded one-shot task, not a resident worker. "
+                "Do not launch background agents, daemons, watchers, or polling loops. "
+                "Do not message the sender separately; your final answer is returned to them.")
+    else:
+        lead = (f"Consultation from @{source}. Reply to this request in your final answer. "
+                "This is a bounded one-shot consultation, not a resident worker. "
+                "Do not launch background agents, daemons, watchers, or polling loops. "
+                "Do not message the sender separately; your final answer is returned to them.")
+    return lead + "\n\n" + message
+
+
+def _signal_group(proc, sig):
     # Signal only while our leader is still alive; never signal a group ID after
     # communicate()/poll() has reaped it and the kernel may have reused that ID.
     if proc.poll() is None:
         if os.name == "posix":
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(proc.pid, sig)
             except ProcessLookupError:
                 pass
         else:
-            proc.kill()
+            try:
+                proc.send_signal(sig)
+            except ProcessLookupError:
+                pass
+
+
+def _stop_group(proc):
+    _signal_group(proc, signal.SIGKILL)
     proc.wait(timeout=10)
 
 
@@ -291,33 +365,19 @@ def _ask(domains, args, **kwargs):
         target = "default" if raw == "hermes" else raw
         _audit(target=target)
         source, root = identity()
-        executable = shutil.which("hermes")
+        executable = _executable()
         if not executable:
             raise RuntimeError("Hermes CLI is not available on this host")
-        target_home = root if target == "default" else root / "profiles" / target
+        target_home = _target_home(root, target)
         if mode == "resume":
-            # CLI accepts titles too. Check exact IDs read-only in the selected
-            # profile; leave compression and live-writer ownership to the CLI.
-            with closing(sqlite3.connect((target_home / "state.db").as_uri() + "?mode=ro", uri=True)) as db:
-                if not db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
-                    raise ValueError("session_id not found in target profile")
+            # CLI accepts titles and latest. Check exact IDs read-only in the
+            # selected profile; leave compression and live-writer ownership to
+            # the CLI.
+            _require_exact_session_id(target_home, session_id)
             _audit(session_id=session_id)
-        env = dict(os.environ)
-        env["HERMES_HOME"] = str(target_home)
-        env[DEPTH_ENV] = "1"
-        scratch = Path(get_hermes_home()) / "cache" / "scratch"
-        scratch.mkdir(parents=True, exist_ok=True)
-        env["TMPDIR"] = str(scratch)
-        argv = [executable, "-p", target, "chat", "--in", str(Path.home()),
-                "--query-file", "-", "--format", "stream-json", "--source", "ask_bot",
-                "--run-budget", "0", "--max-turns", str(MAX_TURNS)]
-        if mode == "resume":
-            argv += ["--resume=" + session_id]
-        payload = (f"Consultation from @{source}. Reply to this request in your final answer. "
-                   "This is a bounded one-shot consultation, not a resident worker. "
-                   "Do not launch background agents, daemons, watchers, or polling loops. "
-                   "Do not message the sender separately; your final answer is returned to them.\n\n"
-                   + message)
+        env, scratch = _child_env(target_home)
+        argv = _cli_argv(executable, target, mode, session_id, "ask_bot")
+        payload = _payload(source, message)
         state = _AUDIT.get()
         request_id = state['record']['request_id'] if state else uuid.uuid4().hex
         with _receiver_lock(root, target, session_id if mode == "resume" else request_id) as acquired:

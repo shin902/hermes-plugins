@@ -53,8 +53,6 @@ class ConsultTests(unittest.TestCase):
         self.assertNotIn('--continue',argv)
         self.assertIn('--format',argv)
         self.assertEqual(argv[argv.index('--source')+1], 'ask_bot')
-        from hermes_state_sessions import INTERNAL_LISTING_SOURCES
-        self.assertNotIn('ask_bot', INTERNAL_LISTING_SOURCES)
         self.assertEqual(argv[argv.index('--query-file')+1],'-')
         self.assertIn(self.args['message'],payload)
         self.assertIn('@coding',payload)

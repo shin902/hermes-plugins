@@ -1,6 +1,6 @@
 name: bot-acl
-version: "0.6.0"
-description: Group ACL, roster filtering, bot consultations, and asynchronous bot tasks.
+version: "0.7.0"
+description: Group ACL, roster filtering, synchronous consultations, and public-CLI bot tasks.
 provides_tools:
   - ask_bot
   - list_bot_peers

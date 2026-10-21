@@ -1,48 +1,24 @@
-"""bot_task spawn modes, unlimited runtime and ownership regressions (no model calls)."""
+"""bot_task public-CLI modes, steering, stop races and process cleanup; no model calls."""
 import json
+import os
+import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from contextlib import closing
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from test_acl import acl
+from _task_fixtures import make_fake_cli, read_events, starts
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 tasks = sys.modules[acl.__name__ + '.bot_task']
 
 
-class FakeChild:
-    def __init__(self, responses=None):
-        self.responses = responses or {}
-        self.calls = []
-        self.sid = None
-        self.session_key = None
-        self.reply = ""
-        self.error = None
-        self.outcome = None
-        self.closed = False
-        self.ready = threading.Event()
-        self.ready.set()
-        self.done = threading.Event()
-        self.proc = Mock()
-        self.proc.poll.return_value = None
-        self.close_calls = 0
-
-    def rpc(self, method, params):
-        self.calls.append((method, params))
-        value = self.responses.get(method, {})
-        if isinstance(value, BaseException):
-            raise value
-        return value
-
-    def close(self):
-        self.close_calls += 1
-        self.closed = True
-
-
-class StartModeTests(unittest.TestCase):
+class TaskCliTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -53,15 +29,20 @@ class StartModeTests(unittest.TestCase):
             home = self.root / 'profiles' / name
             home.mkdir(parents=True)
             (home / 'profile.yaml').write_text('{}\n')
-        token = set_hermes_home_override(self.root / 'profiles/coding')
-        self.addCleanup(reset_hermes_home_override, token)
+        self.source = self.root / 'profiles/coding'
+        self.target = self.root / 'profiles/mail'
+        self.token = set_hermes_home_override(self.source)
+        self.addCleanup(reset_hermes_home_override, self.token)
+        self.log = self.root / 'fake-cli.log'
+        self.cli = make_fake_cli(self.root)
         self.patchers = [
             patch.object(tasks.ask_bot, 'identity', return_value=('coding', self.root)),
-            patch.object(tasks.ask_bot, 'get_hermes_home', return_value=str(self.root / 'profiles/coding')),
+            patch.object(tasks.ask_bot, 'get_hermes_home', return_value=str(self.source)),
             patch.object(tasks, 'check', return_value=None),
-            patch.dict(tasks.os.environ, {tasks.ask_bot.DEPTH_ENV: '0'}),
-            patch.object(tasks.importlib.util, 'find_spec',
-                         return_value=Mock(origin=str(self.root / 'tui_gateway' / '__init__.py'))),
+            patch.object(tasks.ask_bot.shutil, 'which', return_value=str(self.cli)),
+            patch.dict(tasks.os.environ, {tasks.ask_bot.DEPTH_ENV: '0',
+                                          'FAKE_CLI_LOG': str(self.log),
+                                          'FAKE_CLI_MODE': 'complete'}),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -69,240 +50,326 @@ class StartModeTests(unittest.TestCase):
         self.saved = tasks._TASKS.copy()
         tasks._TASKS.clear()
         self.addCleanup(lambda: (tasks._TASKS.clear(), tasks._TASKS.update(self.saved)))
+        self.addCleanup(self._stop_all)
 
-    def new_task(self, mode='new_session', requested=None):
-        task = {'id': 't', 'owner': (str(self.root / 'profiles/coding'), 'parent'),
-                'target': 'mail', 'mode': mode,
-                'requested_session_id': requested if mode == 'resume' else None,
-                'status': 'starting', 'child': None,
-                'lock': threading.RLock()}
-        tasks._TASKS['t'] = task
-        return task
+    def _stop_all(self):
+        for task in list(tasks._TASKS.values()):
+            turn = task.get('turn')
+            if turn is not None and not turn.done.is_set():
+                turn.interrupt(grace=0.2, kill_grace=1.0)
 
-    def start(self, fake, mode='new_session', requested=None):
-        task = self.new_task(mode, requested)
-        with patch.object(tasks, 'Child', return_value=fake):
-            tasks._start(task, 'mail', 'hello', mode, requested)
-        return task
+    def fake(self, mode, **env):
+        return patch.dict(os.environ, {'FAKE_CLI_MODE': mode, **env})
 
     def call(self, args, parent='parent'):
         return json.loads(tasks.handle({}, args, session_id=parent))
 
-    def test_new_session_mode_creates_only(self):
-        fake = FakeChild({
-            'session.create': {'session_id': 'runtime', 'stored_session_id': 'stored'},
-            'prompt.submit': {},
-        })
-        task = self.start(fake)
-        self.assertEqual(task['status'], 'running')
-        self.assertEqual([m for m, _ in fake.calls], ['client.capabilities', 'session.create', 'prompt.submit'])
-        self.assertEqual(fake.calls[-1][1], {'session_id': 'runtime', 'text': 'hello'})
+    def spawn(self, target='mail', message='initial prompt', mode='new_session',
+              session_id=None):
+        args = {'action': 'spawn', 'target': target, 'message': message, 'mode': mode}
+        if session_id is not None:
+            args['session_id'] = session_id
+        return self.call(args)
+
+    def wait_for(self, predicate, timeout=8, message='condition'):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(.01)
+        self.fail('timed out waiting for ' + message)
+
+    def task(self, task_id):
+        return tasks._TASKS[task_id]
+
+    def wait_running(self, task_id, session=True):
+        def ready():
+            task = self.task(task_id)
+            turn = task.get('turn')
+            return (task['status'] == 'running' and turn is not None
+                    and (not session or turn.session_id))
+        self.wait_for(ready, message='task running')
+        return self.task(task_id)
+
+    def wait_status(self, task_id, status):
+        self.wait_for(lambda: self.task(task_id)['status'] == status,
+                      message='task status ' + status)
+        return self.task(task_id)
+
+    def seed_session(self, target='mail', session_id='target-session'):
+        home = self.root if target == 'default' else self.root / 'profiles' / target
+        with closing(sqlite3.connect(home / 'state.db')) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)')
+            db.execute('INSERT OR REPLACE INTO sessions VALUES (?)', (session_id,))
+            db.commit()
+
+    def test_new_session_uses_public_cli_and_parses_result(self):
+        result = self.spawn()
+        task = self.wait_status(result['task_id'], 'completed')
         snapshot = tasks._snapshot(task)
-        self.assertEqual(snapshot['mode'], 'new_session')
-        self.assertEqual(snapshot['session_id'], 'runtime')
-        self.assertEqual(snapshot['stored_session_id'], 'stored')
-        self.assertFalse(snapshot['finality_verified'])
-        self.assertNotIn('timeout_seconds', snapshot)
-        self.assertNotIn('deadline_seconds', snapshot)
+        self.assertIn('initial prompt', snapshot['reply'])
+        self.assertTrue(snapshot['finality_verified'])
+        self.assertEqual(snapshot['transport'], 'public-cli-stream-json')
+        events = starts(self.log)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        argv = event['argv']
+        self.assertEqual(argv[argv.index('-p') + 1], 'mail')
+        self.assertIn('chat', argv)
+        self.assertEqual(argv[argv.index('--query-file') + 1], '-')
+        self.assertEqual(argv[argv.index('--format') + 1], 'stream-json')
+        self.assertEqual(argv[argv.index('--source') + 1], 'bot_task')
+        self.assertEqual(argv[argv.index('--run-budget') + 1], '0')
+        self.assertEqual(argv[argv.index('--max-turns') + 1], '250')
+        self.assertNotIn('--continue', argv)
+        self.assertFalse(any(arg.startswith('--resume=') for arg in argv))
+        self.assertEqual(event['home'], str(self.target))
+        self.assertIn('initial prompt', event['prompt'])
 
-    def test_resume_uses_exact_target_session(self):
-        # No local state.db exists: the target-scoped RPC is the only validator.
-        self.assertFalse((self.root / 'profiles/mail/state.db').exists())
-        fake = FakeChild({
-            'session.resume': {'session_id': 'runtime', 'resumed': 'target-session'},
-            'prompt.submit': {},
-        })
-        task = self.start(fake, mode='resume', requested='target-session')
-        self.assertEqual(task['status'], 'running')
-        methods = [m for m, _ in fake.calls]
-        self.assertNotIn('session.create', methods)
-        self.assertNotIn('session.list', methods)
-        self.assertEqual(methods.count('session.resume'), 1)
-        self.assertEqual(fake.calls[1][1]['session_id'], 'target-session')
-        self.assertEqual(tasks._snapshot(task)['requested_session_id'], 'target-session')
+    def test_resume_uses_exact_id_and_public_cli(self):
+        self.seed_session('mail', 'target-session')
+        result = self.spawn(mode='resume', session_id='target-session')
+        task = self.wait_status(result['task_id'], 'completed')
+        snapshot = tasks._snapshot(task)
+        self.assertEqual(snapshot['session_id'], 'target-session')
+        self.assertEqual(snapshot['requested_session_id'], 'target-session')
+        events = starts(self.log)
+        self.assertEqual(len(events), 1)
+        argv = events[0]['argv']
+        self.assertIn('--resume=target-session', argv)
+        self.assertNotIn('--continue', argv)
+        self.assertNotIn('--create-if-missing', argv)
+        self.assertEqual(events[0]['target'], 'mail')
+        self.assertEqual(events[0]['home'], str(self.target))
 
-    def test_resume_not_found_refusal_neither_prompts_nor_retries(self):
-        fake = FakeChild({
-            'session.resume': tasks.RPCError('session not found', code=4007),
-        })
-        task = self.start(fake, mode='resume', requested='valid-looking-session')
-        self.assertEqual(task['status'], 'failed_unknown')
-        methods = [m for m, _ in fake.calls]
-        self.assertEqual(methods.count('session.resume'), 1)
-        self.assertEqual(methods.count('session.create'), 0)
-        self.assertNotIn('prompt.submit', methods)
-        self.assertTrue(fake.closed)
-
-    def test_resume_ownership_refusal_is_target_busy_without_prompt_or_retry(self):
-        fake = FakeChild({
-            'session.resume': tasks.RPCError('recipient refused', code=4090,
-                                             data={'reason': 'SESSION_NOT_OWNED'}),
-        })
-        task = self.start(fake, mode='resume', requested='valid-looking-session')
-        self.assertEqual(task['status'], 'target_busy')
-        self.assertIn('resend', task['next_step'].lower())
-        methods = [m for m, _ in fake.calls]
-        self.assertEqual(methods.count('session.resume'), 1)
-        self.assertEqual(methods.count('session.create'), 0)
-        self.assertNotIn('prompt.submit', methods)
-        self.assertTrue(fake.closed)
+    def test_resume_rejects_missing_foreign_prefix_title_and_latest(self):
+        self.seed_session('mail', 'target-session')
+        self.seed_session('default', 'other-profile')
+        cases = [
+            ('mail', 'other-profile'),
+            ('mail', 'missing-title'),
+            ('mail', 'target'),
+            ('mail', 'latest'),
+            ('local', 'target-session'),
+        ]
+        for target, session_id in cases:
+            result = self.spawn(target=target, mode='resume', session_id=session_id)
+            if result.get('status') == 'failed':
+                continue
+            task = self.wait_status(result['task_id'], 'failed_unknown')
+            self.assertIn('not found', tasks._snapshot(task)['error'])
+        self.assertEqual(starts(self.log), [])
 
     def test_ownership_refusal_is_target_busy_without_resend(self):
-        fake = FakeChild({
-            'session.create': {'session_id': 'runtime', 'stored_session_id': 'stored'},
-            'prompt.submit': tasks.RPCError('recipient refused',
-                code=4090, data={'reason': 'SESSION_NOT_OWNED'}),
-        })
-        task = self.start(fake)
-        self.assertEqual(task['status'], 'target_busy')
-        self.assertIn('resend', task['next_step'].lower())
-        self.assertEqual([m for m, _ in fake.calls].count('prompt.submit'), 1)
-        self.assertEqual([m for m, _ in fake.calls].count('session.create'), 1)
+        self.seed_session('mail', 'target-session')
+        with self.fake('complete', FAKE_CLI_OWNERSHIP_REFUSAL='1'):
+            result = self.spawn(mode='resume', session_id='target-session')
+            task = self.wait_status(result['task_id'], 'target_busy')
+        self.assertIn('owned by another live process', tasks._snapshot(task)['error'])
+        self.assertEqual(len(starts(self.log)), 1)
 
-    def test_startup_readiness_remains_bounded_without_task_timer(self):
-        fake = FakeChild({'session.create': {'session_id': 'runtime'}, 'prompt.submit': {}})
-        fake.waited = None
-        fake.ready = Mock()
+    def test_partial_result_is_preserved_and_not_completed(self):
+        with self.fake('partial'):
+            result = self.spawn()
+            task = self.wait_status(result['task_id'], 'failed')
+        snapshot = tasks._snapshot(task)
+        self.assertEqual(snapshot['partial_reply'], 'partial evidence')
+        self.assertEqual(snapshot['error'], 'quota')
+        self.assertEqual(snapshot['reply'], '')
 
-        def wait(timeout):
-            fake.waited = timeout
-            return True
-        fake.ready.wait = wait
-        self.start(fake)
-        self.assertEqual(fake.waited, 30)
-        self.assertFalse(hasattr(fake, 'timer'))
-
-
-class HandleValidationTests(unittest.TestCase):
-    setUp = StartModeTests.setUp
-    new_task = StartModeTests.new_task
-    start = StartModeTests.start
-    call = StartModeTests.call
-
-    def test_resume_defers_existence_to_target_scoped_rpc(self):
-        # A valid-looking ID is admitted and handed to the child even though the
-        # target profile has no local state.db to probe.
-        self.assertFalse((self.root / 'profiles/mail/state.db').exists())
-        started = threading.Event()
-        forwarded = []
-
-        def start(*args):
-            forwarded.append(args)
-            started.set()
-
-        with patch.object(tasks, '_start', side_effect=start):
-            result = self.call({'action': 'spawn', 'target': 'mail', 'message': 'hello',
-                                'mode': 'resume', 'session_id': 'valid-looking-session'})
-            self.assertEqual(result['status'], 'starting')
-            self.assertTrue(started.wait(1))
-        self.assertEqual(len(forwarded), 1)
-        _, target, text, mode, requested = forwarded[0]
-        self.assertEqual((target, text, mode, requested),
-                         ('mail', 'hello', 'resume', 'valid-looking-session'))
-
-    def test_resume_rejects_malformed_ids_before_spawn(self):
-        for sid in ('latest', 'LATEST', '--provider=evil', '../state', 'x;false',
-                    '', '   ', 'sess/child', 'a' * 129, None):
-            with patch.object(tasks, '_start') as start:
-                result = self.call({'action': 'spawn', 'target': 'mail', 'message': 'hello',
-                                    'mode': 'resume', 'session_id': sid})
-                self.assertEqual(result['status'], 'failed', sid)
-                start.assert_not_called()
-
-    def test_session_id_only_with_resume(self):
-        for mode in ('new_session', 'bot_chat'):
-            with patch.object(tasks, '_start') as start:
-                result = self.call({'action': 'spawn', 'target': 'mail', 'message': 'hello',
-                                    'mode': mode, 'session_id': 'target-session'})
-            self.assertEqual(result['status'], 'failed')
-            start.assert_not_called()
-
-    def test_mode_validation_and_timeout_rejection(self):
-        with patch.object(tasks, '_start'):
-            for mode in ('unknown', '', None, 'bot_chat'):
-                self.assertEqual(self.call({'action': 'spawn', 'target': 'mail',
-                                            'message': 'hello', 'mode': mode})['status'], 'failed')
-        for timeout in (0, 30, 600, -1, 1, 29, 601, True, 1.5):
-            with patch.object(tasks, '_start') as start:
-                result = self.call({'action': 'spawn', 'target': 'mail', 'message': 'hello',
-                                    'timeout_seconds': timeout})
-                self.assertEqual(result['status'], 'failed', timeout)
-                self.assertIn('timeout_seconds is not supported', result['error'])
-                start.assert_not_called()
-
-    def test_parent_and_resume_session_ids_stay_separate(self):
-        entered = threading.Event()
-        def start(*args):
-            entered.set()
-        with patch.object(tasks, '_start', side_effect=start):
-            result = self.call({'action': 'spawn', 'target': 'mail', 'message': 'hello',
-                                'mode': 'resume', 'session_id': 'target-session'}, parent='parent')
-            self.assertEqual(result['status'], 'starting')
-            self.assertTrue(entered.wait(1))
+    def test_steer_interrupts_generation_and_resumes_without_original_prompt(self):
+        with self.fake('graceful'):
+            result = self.spawn()
             task_id = result['task_id']
-            task = tasks._TASKS[task_id]
-            self.assertEqual(task['owner'], (str(self.root / 'profiles/coding'), 'parent'))
-            self.assertEqual(task['requested_session_id'], 'target-session')
-            self.assertEqual(self.call({'action': 'status', 'task_id': task_id}, parent='other')['status'], 'failed')
+            task = self.wait_running(task_id)
+            session_id = task['turn'].session_id
+            steered = self.call({'action': 'steer', 'task_id': task_id,
+                                 'message': 'new guidance'})
+            self.assertEqual(steered['status'], 'running')
+            self.assertEqual(steered['steer_status'], 'resumed')
+            self.assertEqual(steered['steer_count'], 1)
+            self.assertEqual(steered['session_id'], session_id)
+            self.wait_for(lambda: len(starts(self.log)) == 2, message='resumed turn')
+            self.wait_running(task_id)
+        events = starts(self.log)
+        self.assertEqual(len(events), 2)
+        first, second = events
+        self.assertIn('initial prompt', first['prompt'])
+        self.assertIn('new guidance', second['prompt'])
+        self.assertNotIn('initial prompt', second['prompt'])
+        self.assertIn('--resume=' + session_id, second['argv'])
+        self.assertIn('--run-budget', second['argv'])
+        self.assertEqual(second['argv'][second['argv'].index('--run-budget') + 1], '0')
+        self.assertEqual(second['argv'][second['argv'].index('--max-turns') + 1], '250')
+        self.assertIn('term', [event['event'] for event in read_events(self.log)])
 
-    def test_acl_denial_prevents_spawn(self):
-        with patch.object(tasks, 'check', return_value={'message': 'denied'}), \
-                patch.object(tasks, '_start') as start:
-            result = self.call({'action': 'spawn', 'target': 'local', 'message': 'hello'})
-        self.assertEqual(result['status'], 'blocked')
-        start.assert_not_called()
+    def test_steer_while_tool_running_terminates_tool_process(self):
+        with self.fake('tool'):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id)
+            self.wait_for(lambda: any(event['event'] == 'tool' for event in read_events(self.log)),
+                          message='tool child')
+            tool = next(event for event in read_events(self.log) if event['event'] == 'tool')
+            steered = self.call({'action': 'steer', 'task_id': task_id,
+                                 'message': 'tool guidance'})
+            self.assertEqual(steered['steer_status'], 'resumed')
+            self.wait_for(lambda: len(starts(self.log)) == 2, message='resumed turn')
+            self.wait_for(lambda: not self._alive(tool['pid']), message='tool child exit')
+        self.assertTrue(self._alive(tasks._TASKS[task_id]['turn'].proc.pid)
+                        or tasks._TASKS[task_id]['turn'].done.is_set())
 
-    def test_acl_denial_prevents_resume_spawn(self):
-        with patch.object(tasks, 'check', return_value={'message': 'denied'}), \
-                patch.object(tasks, '_start') as start:
-            result = self.call({'action': 'spawn', 'target': 'local', 'message': 'hello',
-                                'mode': 'resume', 'session_id': 'valid-looking-session'})
-        self.assertEqual(result['status'], 'blocked')
-        self.assertIn('denied', result['error'])
-        start.assert_not_called()
+    def _alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
+    def test_completion_before_steer_sends_nothing(self):
+        result = self.spawn()
+        task_id = result['task_id']
+        self.wait_status(task_id, 'completed')
+        steered = self.call({'action': 'steer', 'task_id': task_id,
+                             'message': 'too late'})
+        self.assertEqual(steered['status'], 'completed')
+        self.assertEqual(steered['steer_status'], 'not_applied_completed')
+        self.assertEqual(len(starts(self.log)), 1)
+        self.assertNotIn('too late', starts(self.log)[0]['prompt'])
 
-class ProcessCleanupTests(unittest.TestCase):
-    def make_child(self):
-        proc = Mock()
-        proc.stdout.readline.return_value = ''
-        proc.stdout.close = Mock()
-        proc.stdin.close = Mock()
-        proc.poll.return_value = None
-        with patch.object(tasks.subprocess, 'Popen', return_value=proc):
-            child = tasks.Child([sys.executable, '-c', 'pass'], {}, '/')
-        return child
+    def test_failed_turn_before_steer_is_not_reported_as_completed(self):
+        with self.fake('partial'):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_status(task_id, 'failed')
+            steered = self.call({'action': 'steer', 'task_id': task_id,
+                                 'message': 'too late'})
+        self.assertEqual(steered['status'], 'failed')
+        self.assertEqual(steered['steer_status'], 'not_applied')
+        # The real failure is preserved, not rewritten as a steer/completion note.
+        self.assertEqual(steered['error'], 'quota')
+        self.assertEqual(len(starts(self.log)), 1)
 
-    def test_no_wallclock_timer_and_stop_still_reaps(self):
-        child = self.make_child()
-        self.assertFalse(hasattr(child, 'timer'))
-        self.assertFalse(hasattr(child, 'deadline'))
-        with patch.object(tasks.ask_bot, '_stop_group') as stop:
-            child.close()
-        stop.assert_called_once_with(child.proc)
-        self.assertTrue(child.closed)
+    def test_missing_session_id_blocks_resume(self):
+        with self.fake('graceful', FAKE_CLI_NO_SESSION_ID='1'):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id, session=False)
+            self.wait_for(lambda: len(starts(self.log)) == 1, message='first turn')
+            steered = self.call({'action': 'steer', 'task_id': task_id,
+                                 'message': 'cannot resume'})
+            self.assertEqual(steered['status'], 'steer_blocked')
+            self.assertEqual(steered['steer_status'], 'blocked_no_session_id')
+            self.assertIsNone(steered['session_id'])
+            self.assertEqual(len(starts(self.log)), 1)
+            self.assertNotIn('cannot resume', starts(self.log)[0]['prompt'])
 
-    def test_session_error_event_settles_failure_without_a_timer(self):
-        proc = Mock()
-        proc.stdout.readline.side_effect = [
-            json.dumps({'jsonrpc': '2.0', 'method': 'event',
-                        'params': {'type': 'error', 'session_id': 'runtime',
-                                   'payload': {'message': 'ownership refused'}}}) + '\n',
-            '',
-        ]
-        proc.stdout.close = Mock()
-        proc.stdin.close = Mock()
-        with patch.object(tasks.subprocess, 'Popen', return_value=proc), \
-                patch.object(tasks.threading, 'Thread') as thread:
-            child = tasks.Child([sys.executable, '-c', 'pass'], {}, '/')
-        thread.assert_called_once()
-        child.sid = 'runtime'
-        child.read()
-        self.assertTrue(child.done.is_set())
-        self.assertEqual(child.outcome, 'failed')
-        self.assertEqual(child.error, 'ownership refused')
-        with patch.object(tasks.ask_bot, '_stop_group'):
-            child.close()
+    def test_forced_shutdown_blocks_resume(self):
+        with self.fake('ignore'), patch.object(tasks, 'SHUTDOWN_GRACE', .2), \
+                patch.object(tasks, 'KILL_GRACE', 1.0):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id)
+            steered = self.call({'action': 'steer', 'task_id': task_id,
+                                 'message': 'must not resume'})
+        self.assertEqual(steered['status'], 'steer_blocked')
+        self.assertEqual(steered['steer_status'], 'blocked_forced_kill')
+        self.assertTrue(steered['forced_kill'])
+        self.assertIn('SIGKILL', steered['error'])
+        self.assertEqual(len(starts(self.log)), 1)
+        self.assertNotIn('must not resume', starts(self.log)[0]['prompt'])
+
+    def test_stop_wins_steer_race(self):
+        with self.fake('slowterm', FAKE_CLI_TERM_DELAY='0.5'), \
+                patch.object(tasks, 'SHUTDOWN_GRACE', 2.0):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id)
+            steered = []
+            thread = threading.Thread(target=lambda: steered.append(
+                self.call({'action': 'steer', 'task_id': task_id,
+                           'message': 'steer must lose'})))
+            thread.start()
+            self.wait_for(lambda: any(event['event'] == 'term'
+                                      for event in read_events(self.log)),
+                          message='SIGTERM sent')
+            stopped = self.call({'action': 'stop', 'task_id': task_id})
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(steered[0]['steer_status'], 'stopped')
+        self.assertIn(stopped['status'], ('stopped', 'stopped_unknown'))
+        self.assertEqual(len(starts(self.log)), 1)
+        self.assertNotIn('steer must lose', starts(self.log)[0]['prompt'])
+
+    def test_multiple_steer_serializes_without_duplicate_sends(self):
+        with self.fake('graceful'):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id)
+            first = self.call({'action': 'steer', 'task_id': task_id,
+                               'message': 'guidance one'})
+            self.assertEqual(first['steer_status'], 'resumed')
+            self.wait_for(lambda: len(starts(self.log)) == 2, message='second turn')
+            self.wait_running(task_id)
+            second = self.call({'action': 'steer', 'task_id': task_id,
+                                'message': 'guidance two'})
+            self.assertEqual(second['steer_status'], 'resumed')
+            self.assertEqual(second['steer_count'], 2)
+            self.wait_for(lambda: len(starts(self.log)) == 3, message='third turn')
+        events = starts(self.log)
+        self.assertEqual(len(events), 3)
+        prompts = [event['prompt'] for event in events]
+        self.assertEqual(sum('initial prompt' in prompt for prompt in prompts), 1)
+        self.assertEqual(sum('guidance one' in prompt for prompt in prompts), 1)
+        self.assertEqual(sum('guidance two' in prompt for prompt in prompts), 1)
+        timeline = [event for event in read_events(self.log)
+                    if event['event'] in ('start', 'end')]
+        active = set()
+        for event in timeline:
+            if event['event'] == 'start':
+                self.assertNotIn(event['pid'], active)
+                active.add(event['pid'])
+            else:
+                active.discard(event['pid'])
+
+    def test_stop_after_completion_does_not_rewrite_outcome(self):
+        result = self.spawn()
+        task_id = result['task_id']
+        self.wait_status(task_id, 'completed')
+        stopped = self.call({'action': 'stop', 'task_id': task_id})
+        self.assertEqual(stopped['status'], 'completed')
+        self.assertEqual(stopped['stop_status'], 'already_finished')
+        self.assertEqual(len(starts(self.log)), 1)
+
+    def test_stop_before_steer_prevents_resume(self):
+        with self.fake('graceful'):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id)
+            self.call({'action': 'stop', 'task_id': task_id})
+            steered = self.call({'action': 'steer', 'task_id': task_id,
+                                 'message': 'no resume'})
+        self.assertEqual(steered['steer_status'], 'stopped')
+        self.assertEqual(len(starts(self.log)), 1)
+        self.assertNotIn('no resume', starts(self.log)[0]['prompt'])
+
+    def test_acl_denial_prevents_spawn_and_control(self):
+        with patch.object(tasks, 'check', return_value={'message': 'denied'}):
+            result = self.spawn(target='local')
+            self.assertEqual(result['status'], 'blocked')
+            result = self.call({'action': 'stop', 'task_id': 'missing'})
+            self.assertEqual(result['status'], 'failed')
+        self.assertEqual(starts(self.log), [])
+
+    def test_unknown_task_and_foreign_parent(self):
+        result = self.spawn()
+        task_id = result['task_id']
+        self.wait_status(task_id, 'completed')
+        self.assertEqual(self.call({'action': 'status', 'task_id': task_id},
+                                   parent='other')['status'], 'failed')
+        self.assertEqual(self.call({'action': 'status', 'task_id': 'nope'})['status'], 'failed')
 
 
 if __name__ == '__main__':

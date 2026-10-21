@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+- Replace the `bot_task` TUI stdio JSON-RPC backend with one public `hermes -p <target> chat --query-file - --format stream-json` subprocess per turn, always with `--run-budget 0` and `--max-turns 250`.
+- Keep `spawn`, `list`, `status`, `wait`, `steer`, and `stop`, parent ownership, same-group ACL, nested-call denial, profile isolation, active-task limits, partial-result reporting, and no automatic resend.
+- Change `steer` to interrupt the active CLI generation or tool execution with `SIGTERM`, wait for the predecessor process group to exit, then resume the same returned session ID in the same target profile with only the new guidance. The original prompt is never resent.
+- Serialize steer/completion/multiple-steer, make stop win races, and block automatic resume after a forced `SIGKILL`, uncertain persistence, or a missing session ID.
+- Report completed turns truthfully after a late stop; only an actually interrupted turn becomes `stopped`/`stopped_unknown`.
+- Remove TUI protocol and private Hermes runtime imports from the plugin and tests. Public `--help`/`sessions list` behavior and deterministic fake-CLI subprocesses are exercised instead.
+- Document the remaining exact-ID blocker: the public CLI accepts titles, `latest`, or prefixes, so a read-only parameterized SQLite exact-ID probe is retained rather than weakening resume validation.
+
 ## 0.6.0
 
 - Keep the synchronous `ask_bot` tool, its registration, auditing, prompt and public CLI transport; also keep `bot_task`.

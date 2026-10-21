@@ -15,52 +15,77 @@ bot_task actions: spawn, list, status, wait, steer, stop.
 spawn admits a task and returns without waiting for child readiness. A bounded
 startup thread retains the caller's contextvars. Spawn modes:
 
-- new_session (default): session.create.
-- resume: an exact target-owned stored session ID. Titles, "latest" and malformed
-  IDs are rejected lexically before a child starts; the target-scoped
-  session.resume RPC then validates existence and ownership before prompt.submit.
-  bot_task never reads the target profile's state.db or sessions table.
+- new_session (default): a fresh public CLI turn in the target profile.
+- resume: an exact target-owned stored session ID. Titles, "latest", aliases,
+  prefixes and malformed IDs are rejected before launch; the exact ID is checked
+  read-only in the target profile before the CLI starts.
 
 No bot_chat mode: bot_task never looks up, creates, or continues a canonical Bot
 Chat. No caller timeout_seconds: the handler rejects that key explicitly,
-including value 0. The child has no wall-clock timer and no deadline. Explicit
-stop still kills and reaps the dedicated child process group. Effects already
-performed cannot be rolled back. Existing same-group ACL, parent ownership and
-active-task limits apply. status/wait/stop/steer require task_id; list takes no
-extra fields.
+including value 0. Each CLI turn has no wall-clock timer and no deadline
+(--run-budget 0, --max-turns 250). Explicit stop still terminates and reaps the
+dedicated CLI process group. Effects already performed cannot be rolled back.
+Existing same-group ACL, parent ownership and active-task limits apply.
+status/wait/stop/steer require task_id; list takes no extra fields.
 
 The verified parent session_id comes only from the tool runtime keyword arguments.
 spawn.session_id is accepted only with mode=resume and is the target-owned stored
 session. It never becomes the task owner key.
 
-Transport: with the same-group ACL applied, ask_bot uses the installed public
-CLI; bot_task uses the installed official TUI's tui_gateway.entry stdio JSON-RPC
-subprocess, session.create, session.resume, prompt.submit, session.steer and
-session.activate. No HTTP API listener or shared gateway changes. No private
-function imports or core patches. The module entrypoint is shipped by Hermes; a
-stable documented third-party compatibility guarantee has NOT been established.
-Runtime discovery is used and a missing entrypoint fails closed, without another
+Transport: with the same-group ACL applied, both tools use the installed public
+CLI:
+
+  hermes -p <target> chat --in <home> --query-file - --format stream-json
+    --source <ask_bot|bot_task> --run-budget 0 --max-turns 250
+    [--resume=<exact-id>]
+
+There is no TUI stdio JSON-RPC gateway, HTTP API listener, shared gateway change,
+arbitrary RPC passthrough, private function import, or core patch. Target
+isolation uses -p <target>, HERMES_HOME, and removal of inherited TUI/profile/
+session environment variables. A missing CLI fails closed without another
 transport resend.
 
-Important capability boundary:
-The installed TUI backend owns pending_steer replay in
-_run_post_turn_followups. The plugin never duplicates that replay. The public
-stdio results do not expose pending_steer plus a definitive drained/final marker,
-so the plugin CANNOT certify exactly-once replay or finality. message.complete can
-precede another automatic turn. Status includes finality_verified=false; observed
-completed can return to running. The child is not killed on the first complete
-event, preventing premature loss of backend-owned replay. It remains bounded by
-explicit stop. A stop racing with a follow-up that has already begun cannot
-retroactively prevent that execution.
+Steering semantics (0.7.0):
+- steer interrupts the active generation or tool execution by sending SIGTERM to
+  the CLI process group, waits for the predecessor to exit, then starts a new
+  public CLI turn with --resume=<same returned session_id> in the same target
+  profile. Only the new guidance is sent; the original prompt is never resent.
+- A turn that already completed cannot be steered. steer returns
+  not_applied_completed and starts no process.
+- Multiple steers are serialized by the task lock. Each waits for the previous
+  writer to terminate; writers never overlap.
+- Stop sets its race flag before waiting for an in-flight steer. A steer that
+  loses the race does not resume. A late stop after a completed turn leaves the
+  truthful completed/failed outcome and reports stop_status=already_finished.
+- If SIGTERM does not stop the CLI within the shutdown grace, the plugin sends a
+  bounded SIGKILL. A forced kill means persistence is uncertain, so automatic
+  resume is blocked (blocked_forced_kill). A missing session_id also blocks
+  resume (blocked_no_session_id).
+- A graceful SIGTERM shutdown may still leave an interrupted turn partial; its
+  partial output is reported as partial_reply, never as a completed reply.
 
-Ownership refusal during session.resume or prompt.submit (SESSION_NOT_OWNED /
-code 4090 / busy) becomes target_busy with no automatic retry, resend or mode
-switch. A public resume not-found refusal and other startup failures become
-failed_unknown. In both cases no prompt is submitted and the child is closed.
+Ownership refusal during the public CLI turn (hermes-refusal-reason:
+SESSION_NOT_OWNED) becomes target_busy with no automatic retry, resend or mode
+switch. Exact-ID resume not found, startup failure and other transport failures
+become failed_unknown with no prompt resent.
 
-No claim is made that accepted guidance was consumed at a live tool boundary.
-The returned backend result is preserved. No automatic resend is attempted.
-Protocol tests create seeded sessions in temporary empty profiles to verify exact
-session.resume without invoking a model; process-shared ownership is exercised
-directly through the installed registry. A model-driven end-to-end
-steering/replay test was not performed.
+Exact-ID blocker:
+The public CLI has no exact-ID existence check. `chat --resume` accepts titles
+and "latest"; `hermes sessions export --session-id` accepts unique prefixes and
+materializes transcript data; `hermes sessions list` is capped and has no ID
+filter. The plugin therefore keeps a read-only parameterized SQLite
+SELECT 1 FROM sessions WHERE id = ? probe in the selected profile. This is a
+documented internal storage dependency and remaining upstream seam. It never
+accepts a title, prefix, "latest" or foreign profile; an absent/unreadable store
+fails closed.
+
+Testing:
+- Deterministic fake-CLI subprocess tests cover complete turns, init/result
+  parsing, graceful SIGTERM, forced SIGKILL, tool-child termination, missing
+  session IDs, public resume argv, no duplicate sends, completion-before-steer,
+  multiple steer, stop races, ACL/ownership, partial results and profile env.
+- Actual public CLI behavior is exercised only through `hermes chat --help` and
+  `hermes sessions list` in an isolated temporary HERMES_HOME. A live
+  model-driven generation/tool steer was not performed and is explicitly
+  unverified.
+- No local-group profile data is read or sent to a cloud model by the tests.
