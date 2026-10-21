@@ -9,6 +9,8 @@
 - Report completed turns truthfully after a late stop; only an actually interrupted turn becomes `stopped`/`stopped_unknown`.
 - Prefer a terminal result's `session_id` over the turn's init ID so a compression continuation resumes the returned session; retain the init and exact requested-resume fallbacks.
 - Keep an interrupting steer handoff active after its predecessor turn settles so concurrent spawns cannot exceed the owner/process limits or evict the handoff task from the process-local task map.
+- Preserve actionable task-level errors (missing session ID, revoked ACL, replacement launch failure) instead of masking them with the interrupted predecessor turn's error.
+- When `stop` finds no turn, only mark a pending start as stopped; preserve a settled startup failure and report `already_finished`.
 - Remove TUI protocol and private Hermes runtime imports from the plugin and tests. Public `--help`/`sessions list` behavior and deterministic fake-CLI subprocesses are exercised instead.
 - Document the remaining exact-ID blocker: the public CLI accepts titles, `latest`, or prefixes, so a read-only parameterized SQLite exact-ID probe is retained rather than weakening resume validation.
 

@@ -295,6 +295,11 @@ def _watch(task, turn):
     with task["lock"]:
         if task.get("turn") is not turn:
             return
+        if task.get("status") not in ("starting", "running", "interrupting"):
+            # A control action (stop/steer) already recorded the task-level
+            # outcome for this turn; do not let the settled predecessor
+            # overwrite its actionable status or error.
+            return
         if task.get("cancelled") and turn.interrupted:
             task["status"] = "stopped_unknown" if turn.forced else "stopped"
         else:
@@ -334,6 +339,9 @@ def _refresh(task):
     turn = task.get("turn")
     if not turn or not turn.done.is_set() or task.get("turn") is not turn:
         return
+    if task.get("status") not in ("starting", "running", "interrupting"):
+        # A settled task-level outcome is authoritative for this turn.
+        return
     if task.get("cancelled") and turn.interrupted:
         task["status"] = "stopped_unknown" if turn.forced else "stopped"
     else:
@@ -348,13 +356,20 @@ def _refresh(task):
 
 def _snapshot(task):
     turn = task.get("turn")
+    # A task-level error (missing session ID, revoked ACL, replacement launch
+    # failure) describes the action that just failed. Prefer it over the
+    # predecessor turn's interruption error, which would mask the actionable
+    # cause; fall back to the turn error until the turn is synchronized.
+    error = task.get("error")
+    if error is None and turn is not None:
+        error = turn.error
     snapshot = {
         "task_id": task["id"], "target": task["target"],
         "mode": task.get("mode", "new_session"), "status": task["status"],
         "session_id": task.get("session_id") or (turn.session_id if turn else None),
         "requested_session_id": task.get("requested_session_id"),
         "reply": (turn.reply if turn else task.get("reply", "")) or "",
-        "error": (turn.error if turn and turn.error else task.get("error")),
+        "error": error,
         "next_step": task.get("next_step"),
         "turn": task.get("turns", 0),
         "steer_count": task.get("steer_count", 0),
@@ -382,7 +397,11 @@ def _steer_ended(task):
         task["error"] = "The active turn completed before steer; no guidance was sent."
     else:
         task["steer_status"] = "not_applied"
-        task["error"] = "The active turn had already ended before steer; no guidance was sent."
+        # Preserve the settled turn's real failure (for example a quota error);
+        # the steer status already records that no guidance was sent.
+        if not task.get("error"):
+            task["error"] = ("The active turn had already ended before steer; "
+                             "no guidance was sent.")
     return _snapshot(task)
 
 
@@ -569,8 +588,14 @@ def handle(domains, args, **kwargs):
                 if action == "stop":
                     turn = task.get("turn")
                     if turn is None:
-                        task["cancelled"] = True
-                        task["status"] = "stopped"
+                        if task["status"] == "starting":
+                            # No writer exists yet; cancel the pending launch.
+                            task["cancelled"] = True
+                            task["status"] = "stopped"
+                        else:
+                            # Startup already failed (for example a missing
+                            # session ID). Preserve that settled error.
+                            task["stop_status"] = "already_finished"
                     elif turn.done.is_set() and not turn.interrupted:
                         # Stop arrived after the turn had already settled. Do not
                         # rewrite a completed/failed outcome as stopped.

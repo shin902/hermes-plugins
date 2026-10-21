@@ -287,8 +287,81 @@ class TaskCliTests(unittest.TestCase):
             self.assertEqual(steered['status'], 'steer_blocked')
             self.assertEqual(steered['steer_status'], 'blocked_no_session_id')
             self.assertIsNone(steered['session_id'])
+            self.assertIn('no session_id', steered['error'])
+            self.assertNotIn('CLI turn was interrupted', steered['error'])
             self.assertEqual(len(starts(self.log)), 1)
             self.assertNotIn('cannot resume', starts(self.log)[0]['prompt'])
+            # A later refresh must not replace the actionable cause with the
+            # predecessor turn's interruption error.
+            status = self.call({'action': 'status', 'task_id': task_id})
+        self.assertEqual(status['status'], 'steer_blocked')
+        self.assertEqual(status['error'], steered['error'])
+
+    def test_steer_acl_revocation_preserves_actionable_error(self):
+        with self.fake('graceful'):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id)
+            with patch.object(tasks, 'check',
+                              side_effect=[None, {'message': 'revoked mid-task'}]):
+                steered = self.call({'action': 'steer', 'task_id': task_id,
+                                     'message': 'must not send'})
+        self.assertEqual(steered['status'], 'blocked')
+        self.assertEqual(steered['steer_status'], 'blocked_acl')
+        self.assertEqual(steered['error'], 'revoked mid-task')
+        self.assertEqual(len(starts(self.log)), 1)
+
+    def test_steer_launch_failure_preserves_actionable_error(self):
+        with self.fake('graceful'):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id)
+            with patch.object(tasks.ask_bot, '_executable', return_value=None):
+                steered = self.call({'action': 'steer', 'task_id': task_id,
+                                     'message': 'replacement must fail'})
+        self.assertEqual(steered['status'], 'steer_blocked')
+        self.assertEqual(steered['steer_status'], 'blocked_launch_failed')
+        self.assertIn('Hermes CLI is not available', steered['error'])
+        self.assertNotIn('CLI turn was interrupted', steered['error'])
+        self.assertEqual(len(starts(self.log)), 1)
+
+    def test_stop_while_starting_marks_stopped(self):
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        real_launch = tasks._launch
+
+        def launch(*args, **kwargs):
+            entered.set()
+            try:
+                release.wait(5)
+                return real_launch(*args, **kwargs)
+            finally:
+                finished.set()
+
+        with patch.object(tasks, '_launch', side_effect=launch), self.fake('complete'):
+            result = self.spawn()
+            task_id = result['task_id']
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(self.task(task_id)['status'], 'starting')
+                self.assertIsNone(self.task(task_id)['turn'])
+                stopped = self.call({'action': 'stop', 'task_id': task_id})
+            finally:
+                release.set()
+            self.assertTrue(finished.wait(5))
+        self.assertEqual(stopped['status'], 'stopped')
+        self.assertEqual(starts(self.log), [])
+
+    def test_stop_after_settled_startup_failure_preserves_status(self):
+        result = self.spawn(mode='resume', session_id='missing-session')
+        task = self.wait_status(result['task_id'], 'failed_unknown')
+        error = tasks._snapshot(task)['error']
+        stopped = self.call({'action': 'stop', 'task_id': result['task_id']})
+        self.assertEqual(stopped['status'], 'failed_unknown')
+        self.assertEqual(stopped['stop_status'], 'already_finished')
+        self.assertEqual(stopped['error'], error)
+        self.assertEqual(starts(self.log), [])
 
     def test_forced_shutdown_blocks_resume(self):
         with self.fake('ignore'), patch.object(tasks, 'SHUTDOWN_GRACE', .2), \

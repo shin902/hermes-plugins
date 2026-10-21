@@ -30,12 +30,22 @@ class AsyncTests(TaskTests):
 
     def test_cancel_before_start_does_not_launch(self):
         tasks._TASKS['t']['turn'] = None
+        tasks._TASKS['t']['status'] = 'starting'
         self.assertEqual(self.call('stop', task_id='t')['status'], 'stopped')
         with patch.object(tasks, '_launch') as launch:
             tasks._start(tasks._TASKS['t'], 'mail', 'do not run', 'new_session', None)
             launch.assert_called_once()
         # _launch itself refuses a cancelled task without creating a turn.
         self.assertIsNone(tasks._TASKS['t']['turn'])
+
+    def test_stop_without_turn_preserves_settled_startup_failure(self):
+        self._add_task('failed', 'failed_unknown', None)
+        tasks._TASKS['failed']['error'] = 'session_id not found in target profile'
+        stopped = self.call('stop', task_id='failed')
+        self.assertEqual(stopped['status'], 'failed_unknown')
+        self.assertEqual(stopped['stop_status'], 'already_finished')
+        self.assertEqual(stopped['error'], 'session_id not found in target profile')
+        self.assertFalse(tasks._TASKS['failed']['cancelled'])
 
     def test_wait_registered_and_handled(self):
         self.assertIn('wait', tasks.SCHEMA['parameters']['properties']['action']['enum'])
