@@ -59,7 +59,14 @@ def omh_decision_gate_handler(
     if not isinstance(args, dict) or set(args) - allowed or set(_REQUIRED_DECISION_GATE_FIELDS) - set(args):
         return json.dumps(attach_public_observation(_invalid_result("invalid_payload"), observation), sort_keys=True)
     payload = {key: args[key] for key in _REQUIRED_DECISION_GATE_FIELDS}
-    from omh.workflows.decision_gate_receipts import validate_connector_decision_payload
+    try:
+        from omh.workflows.decision_gate_receipts import validate_connector_decision_payload
+    except ImportError as import_error:
+        if not _missing_optional_backend(import_error):
+            raise
+        return json.dumps(
+            attach_public_observation(_unavailable_result(import_error), observation), sort_keys=True
+        )
 
     parsed_payload, error = validate_connector_decision_payload(payload)
     if error:
@@ -71,8 +78,15 @@ def omh_decision_gate_handler(
         return json.dumps(attach_public_observation(_invalid_result("invalid_host_context"), observation), sort_keys=True)
     if trusted_payload != parsed_payload:
         return json.dumps(attach_public_observation(_invalid_result("host_context_mismatch"), observation), sort_keys=True)
-    from omh.paths import resolve_paths
-    from omh.commands.decision_gate import apply_connector_decision_answer
+    try:
+        from omh.paths import resolve_paths
+        from omh.commands.decision_gate import apply_connector_decision_answer
+    except ImportError as import_error:
+        if not _missing_optional_backend(import_error):
+            raise
+        return json.dumps(
+            attach_public_observation(_unavailable_result(import_error), observation), sort_keys=True
+        )
 
     paths = resolve_paths(
         omh_home=default_omh_home(),
@@ -80,6 +94,34 @@ def omh_decision_gate_handler(
     )
     result = apply_connector_decision_answer(paths, **parsed_payload)
     return json.dumps(attach_public_observation(result, observation), sort_keys=True)
+
+
+def _missing_optional_backend(error: ImportError) -> bool:
+    """Whether an import failed because this host lacks an ``omh`` backend module.
+
+    Only an ``omh`` name counts. A missing third-party import inside the
+    installed backend is a broken install, not the documented metadata-only
+    host where this tool must still return a bounded result.
+    """
+    failed = str(getattr(error, "name", "") or "")
+    return failed == "omh" or failed.startswith("omh.")
+
+
+def _unavailable_result(error: ImportError) -> dict[str, Any]:
+    failed = str(getattr(error, "name", "") or "omh")
+    return {
+        "schema_version": "connector_decision_gate_result/v1",
+        "status": "unavailable",
+        "reason_code": "omh_decision_gate_core_unavailable",
+        "receipt": {},
+        "detail": (
+            "No gate answer was recorded: the installed OMH package is unavailable on this "
+            f"host ({failed}); install oh-my-hermes or use the omh runtime decision-gate answer CLI."
+        ),
+        "claim_boundary": (
+            "A connector decision-gate result is metadata-only and never treats free-form chat text as approval."
+        ),
+    }
 
 
 def _invalid_result(reason_code: str = "invalid_payload") -> dict[str, Any]:
