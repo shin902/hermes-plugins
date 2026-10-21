@@ -23,8 +23,11 @@ log({"event": "start", "pid": os.getpid(), "argv": argv, "target": target,
      "resume": resume, "prompt": prompt, "home": os.environ.get("HERMES_HOME")})
 if resume:
     sid = os.environ.get("FAKE_CLI_RESUME_RETURN_ID", resume)
-session_evidence = ({} if os.environ.get("FAKE_CLI_NO_SESSION_ID") == "1"
-                    else {"session_id": sid})
+init_sid = sid
+terminal_sid = os.environ.get("FAKE_CLI_TERMINAL_SESSION_ID", init_sid)
+no_session = os.environ.get("FAKE_CLI_NO_SESSION_ID") == "1"
+session_evidence = {} if no_session else {"session_id": init_sid}
+result_evidence = {} if no_session else {"session_id": terminal_sid}
 if session_evidence:
     print(json.dumps({"type": "system", "subtype": "init", **session_evidence}), flush=True)
 if os.environ.get("FAKE_CLI_OWNERSHIP_REFUSAL") == "1":
@@ -33,12 +36,12 @@ if os.environ.get("FAKE_CLI_OWNERSHIP_REFUSAL") == "1":
     sys.exit(1)
 if mode == "partial":
     print(json.dumps({"type": "result", "exit_code": 1, "text": "partial evidence",
-                      "error": "quota", **session_evidence}), flush=True)
+                      "error": "quota", **result_evidence}), flush=True)
     log({"event": "end", "pid": os.getpid(), "status": "partial"})
     sys.exit(1)
 if mode == "complete":
     print(json.dumps({"type": "result", "exit_code": 0,
-                      "text": "reply:" + prompt[-120:], **session_evidence}), flush=True)
+                      "text": "reply:" + prompt[-120:], **result_evidence}), flush=True)
     log({"event": "end", "pid": os.getpid(), "status": "complete"})
     sys.exit(0)
 
@@ -47,14 +50,14 @@ def on_term(signum, frame):
     if mode in ("graceful", "tool"):
         print(json.dumps({"type": "result", "exit_code": 130,
                           "status": "interrupted", "text": "interrupted partial",
-                          **session_evidence}), flush=True)
+                          **result_evidence}), flush=True)
         log({"event": "end", "pid": os.getpid(), "status": "interrupted"})
         sys.exit(130)
     if mode == "slowterm":
         time.sleep(float(os.environ.get("FAKE_CLI_TERM_DELAY", "0.5")))
         print(json.dumps({"type": "result", "exit_code": 130,
                           "status": "interrupted", "text": "interrupted partial",
-                          **session_evidence}), flush=True)
+                          **result_evidence}), flush=True)
         log({"event": "end", "pid": os.getpid(), "status": "interrupted"})
         sys.exit(130)
     # ignore mode: keep running so the caller must escalate to SIGKILL.

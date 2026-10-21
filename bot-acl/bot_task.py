@@ -136,7 +136,10 @@ class Turn:
         parsed = ask_bot._outcome(self.exit_code, output, errors, False,
                                   self.target, self.mode)
         with self.lock:
-            self.session_id = (self.session_id or parsed.get("session_id")
+            # A terminal result may carry a compression-continuation ID that
+            # differs from the turn's init ID. Prefer the parsed terminal ID;
+            # fall back to the init ID, then the exact requested resume ID.
+            self.session_id = (parsed.get("session_id") or self.session_id
                                or (self.requested_session_id if self.mode == "resume" else None))
             self.reply = parsed.get("reply", "") if isinstance(parsed.get("reply"), str) else ""
             self.partial_reply = parsed.get("partial_reply")
@@ -462,10 +465,16 @@ def _steer(task, domains, text):
 def _is_active(task):
     if task.get("cancelled"):
         return False
+    # A steer handoff remains active after its predecessor turn settles: the
+    # replacement turn is launched under the same task record. Counting it as
+    # inactive here would let a concurrent spawn exceed the owner/process limits
+    # and could evict the handoff task from _TASKS.
+    if task["status"] == "interrupting":
+        return True
     turn = task.get("turn")
     if turn is not None and turn.done.is_set():
         return False
-    return task["status"] in ("starting", "running", "interrupting")
+    return task["status"] in ("starting", "running")
 
 
 def handle(domains, args, **kwargs):

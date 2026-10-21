@@ -35,12 +35,15 @@ class TurnIntegrationTests(unittest.TestCase):
         self.env.pop('FAKE_CLI_NO_SESSION_ID', None)
         self.env.pop('FAKE_CLI_OWNERSHIP_REFUSAL', None)
 
-    def turn(self, mode='complete', payload='literal $(false)', **env):
+    def turn(self, mode='complete', payload='literal $(false)', turn_mode='new_session',
+             requested_session_id=None, **env):
         child_env = dict(self.env, FAKE_CLI_MODE=mode, **env)
         argv = [str(self.cli), '-p', 'mail', 'chat', '--query-file', '-',
                 '--format', 'stream-json', '--run-budget', '0', '--max-turns', '250']
+        if turn_mode == 'resume':
+            argv.append('--resume=' + (requested_session_id or 'requested-session'))
         return tasks.Turn(argv, payload, child_env, Path.home(), self.root,
-                          'mail', 'new_session')
+                          'mail', turn_mode, requested_session_id)
 
     def test_complete_turn_parses_init_and_result(self):
         turn = self.turn()
@@ -73,6 +76,26 @@ class TurnIntegrationTests(unittest.TestCase):
         self.assertEqual(turn.outcome, 'forced_stop_unknown')
         self.assertTrue(turn.forced)
         self.assertIn('SIGKILL', turn.error)
+
+    def test_terminal_session_id_wins_over_init(self):
+        turn = self.turn('complete', FAKE_CLI_SESSION_ID='init-session',
+                         FAKE_CLI_TERMINAL_SESSION_ID='terminal-session')
+        self.assertTrue(turn.done.wait(8))
+        self.assertEqual(turn.outcome, 'completed')
+        self.assertEqual(turn.session_id, 'terminal-session')
+
+    def test_init_session_id_remains_fallback(self):
+        turn = self.turn('complete', FAKE_CLI_SESSION_ID='init-session',
+                         FAKE_CLI_TERMINAL_SESSION_ID='')
+        self.assertTrue(turn.done.wait(8))
+        self.assertEqual(turn.session_id, 'init-session')
+
+    def test_resume_requested_id_is_final_fallback(self):
+        turn = self.turn('complete', turn_mode='resume',
+                         requested_session_id='requested-session',
+                         FAKE_CLI_NO_SESSION_ID='1')
+        self.assertTrue(turn.done.wait(8))
+        self.assertEqual(turn.session_id, 'requested-session')
 
     def test_missing_session_id_is_not_invented(self):
         turn = self.turn('complete', FAKE_CLI_NO_SESSION_ID='1')

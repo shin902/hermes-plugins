@@ -142,6 +142,14 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(events[0]['target'], 'mail')
         self.assertEqual(events[0]['home'], str(self.target))
 
+    def test_completed_turn_prefers_terminal_session_id_over_init(self):
+        with self.fake('complete', FAKE_CLI_SESSION_ID='init-session',
+                       FAKE_CLI_TERMINAL_SESSION_ID='terminal-session'):
+            result = self.spawn()
+            task = self.wait_status(result['task_id'], 'completed')
+        snapshot = tasks._snapshot(task)
+        self.assertEqual(snapshot['session_id'], 'terminal-session')
+
     def test_resume_rejects_missing_foreign_prefix_title_and_latest(self):
         self.seed_session('mail', 'target-session')
         self.seed_session('default', 'other-profile')
@@ -202,6 +210,22 @@ class TaskCliTests(unittest.TestCase):
         self.assertEqual(second['argv'][second['argv'].index('--run-budget') + 1], '0')
         self.assertEqual(second['argv'][second['argv'].index('--max-turns') + 1], '250')
         self.assertIn('term', [event['event'] for event in read_events(self.log)])
+
+    def test_steer_resumes_terminal_id_after_compression_continuation(self):
+        with self.fake('graceful', FAKE_CLI_SESSION_ID='init-session',
+                       FAKE_CLI_TERMINAL_SESSION_ID='terminal-session'):
+            result = self.spawn()
+            task_id = result['task_id']
+            self.wait_running(task_id)
+            steered = self.call({'action': 'steer', 'task_id': task_id,
+                                 'message': 'continue after compression'})
+            self.assertEqual(steered['steer_status'], 'resumed')
+            self.assertEqual(steered['session_id'], 'terminal-session')
+            self.wait_for(lambda: len(starts(self.log)) == 2, message='resumed turn')
+        second = starts(self.log)[1]
+        self.assertIn('--resume=terminal-session', second['argv'])
+        self.assertNotIn('--resume=init-session', second['argv'])
+        self.assertIn('continue after compression', second['prompt'])
 
     def test_steer_while_tool_running_terminates_tool_process(self):
         with self.fake('tool'):
