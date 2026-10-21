@@ -30,6 +30,14 @@ if mode == "startup":
          "resume": resume, "prompt": prompt, "home": os.environ.get("HERMES_HOME")})
     log({"event": "end", "pid": os.getpid(), "status": "startup"})
     sys.exit(0)
+if mode == "stdinhold":
+    # Post-Popen failure probe: block on stdin, ignore SIGTERM, then keep
+    # running so the caller must close stdin and reap the child.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    prompt = sys.stdin.read()
+    log({"event": "stdin_eof", "pid": os.getpid(), "prompt": prompt})
+    while True:
+        time.sleep(0.05)
 prompt = sys.stdin.read()
 log({"event": "start", "pid": os.getpid(), "argv": argv, "target": target,
      "resume": resume, "prompt": prompt, "home": os.environ.get("HERMES_HOME")})

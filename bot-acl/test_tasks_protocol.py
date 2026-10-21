@@ -23,6 +23,29 @@ from _task_fixtures import make_fake_cli, read_events
 tasks = sys.modules[acl.__name__ + '.bot_task']
 
 
+class _ObservedLock:
+    """RLock wrapper that records the interrupter owning the completion lock."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.interrupter_entered = threading.Event()
+
+    def __enter__(self):
+        self._lock.acquire()
+        if threading.current_thread().name == 'bot-task-interrupt':
+            self.interrupter_entered.set()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._lock.release()
+
+    def acquire(self, blocking=True, timeout=-1):
+        return self._lock.acquire(blocking=blocking, timeout=timeout)
+
+    def release(self):
+        self._lock.release()
+
+
 class TurnIntegrationTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -100,6 +123,95 @@ class TurnIntegrationTests(unittest.TestCase):
         self.assertEqual([event['prompt'] for event in starts], [''])
         self.assertNotIn('SECRET-PAYLOAD', self.log.read_text(encoding='utf-8'))
         self.assertFalse(self.alive(turn.proc.pid))
+
+    def test_interrupt_after_leader_exit_does_not_hold_completion_lock(self):
+        parsing = threading.Event()
+        release = threading.Event()
+        real_outcome = tasks.ask_bot._outcome
+
+        def blocked_outcome(*args, **kwargs):
+            parsing.set()
+            release.wait(5)
+            return real_outcome(*args, **kwargs)
+
+        with patch.object(tasks.ask_bot, '_outcome', side_effect=blocked_outcome):
+            turn = self.turn('complete')
+            self.assertTrue(parsing.wait(8), 'turn did not reach result parsing')
+            deadline = time.monotonic() + 5
+            while turn.proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertIsNotNone(turn.proc.poll(), 'leader did not exit')
+
+            observed = _ObservedLock()
+            turn.lock = observed
+            results = []
+            interrupter = threading.Thread(
+                name='bot-task-interrupt', daemon=True,
+                target=lambda: results.append(
+                    turn.interrupt(grace=1.0, kill_grace=5.0)))
+            started = time.monotonic()
+            interrupter.start()
+            self.assertTrue(observed.interrupter_entered.wait(2),
+                            'interrupt did not enter the completion lock')
+            release.set()
+            interrupter.join(2)
+            elapsed = time.monotonic() - started
+
+        self.assertFalse(interrupter.is_alive(),
+                         'interrupt waited for publication while holding its lock')
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(results, [None])
+        self.assertTrue(turn.done.wait(2))
+        self.assertEqual(turn.outcome, 'completed')
+
+    def test_post_popen_failure_closes_stdin_and_reaps_child(self):
+        class FailingStdin:
+            def __init__(self, stream):
+                self._stream = stream
+
+            def write(self, data):
+                raise RuntimeError('post-popen transport failure')
+
+            def close(self):
+                self._stream.close()
+
+            @property
+            def closed(self):
+                return self._stream.closed
+
+        class FailingProc:
+            def __init__(self, proc):
+                self._proc = proc
+                self.stdin = FailingStdin(proc.stdin)
+
+            def __getattr__(self, name):
+                return getattr(self._proc, name)
+
+        real_popen = subprocess.Popen
+
+        def failing_popen(*args, **kwargs):
+            return FailingProc(real_popen(*args, **kwargs))
+
+        with patch.object(tasks, 'SHUTDOWN_GRACE', .2), \
+                patch.object(tasks, 'KILL_GRACE', 1.0), \
+                patch.object(tasks.subprocess, 'Popen', side_effect=failing_popen):
+            turn = self.turn('stdinhold', payload='must not be written')
+            self.assertTrue(turn.done.wait(8))
+
+        self.assertEqual(turn.outcome, 'failed')
+        self.assertIn('post-popen transport failure', turn.error)
+        self.assertTrue(turn.started.is_set())
+        self.assertIsNotNone(turn.proc.poll(), 'child was not reaped')
+        self.assertTrue(turn.proc.stdin.closed, 'stdin was not closed')
+        self.assertFalse(self.alive(turn.proc.pid))
+
+    def test_payload_encoding_failure_never_starts_child(self):
+        turn = self.turn('complete', payload='\ud800')
+        self.assertTrue(turn.done.wait(5))
+        self.assertEqual(turn.outcome, 'failed')
+        self.assertIn('transport_failed', turn.error)
+        self.assertIsNone(turn.proc)
+        self.assertEqual(read_events(self.log), [])
 
     def test_forced_kill_marks_persistence_unknown(self):
         with patch.object(tasks, 'SHUTDOWN_GRACE', .2), patch.object(tasks, 'KILL_GRACE', 1.0):

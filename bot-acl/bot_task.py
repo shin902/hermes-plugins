@@ -127,14 +127,60 @@ class Turn:
         except (OSError, ValueError):
             pass
 
-    def _finish(self):
+    def _close_stdin(self):
+        try:
+            if self.proc is not None and self.proc.stdin is not None:
+                self.proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def _reap(self):
+        """Close stdin and boundedly stop/reap the child before publication.
+
+        Called by the turn thread on every exit path. Cleanup is best effort so
+        a failure here never replaces the diagnostic that led to this path.
+        """
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            self._close_stdin()
+            if proc.poll() is not None:
+                return
+            ask_bot._signal_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=SHUTDOWN_GRACE)
+            except subprocess.TimeoutExpired:
+                ask_bot._signal_group(proc, signal.SIGKILL)
+                proc.wait(timeout=KILL_GRACE)
+        except Exception:
+            pass
+
+    def _close_streams(self):
+        for stream in (self._output, self._errors):
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def _finish(self, failure=None):
         try:
             output = ask_bot._tail(self._output)
             errors = ask_bot._tail(self._errors, 8192)
         except Exception as exc:
             output, errors = "", "transport_failed: " + str(exc)
-        parsed = ask_bot._outcome(self.exit_code, output, errors, False,
-                                  self.target, self.mode)
+            if failure is None:
+                failure = exc
+        if failure is None:
+            try:
+                parsed = ask_bot._outcome(self.exit_code, output, errors, False,
+                                          self.target, self.mode)
+            except Exception as exc:
+                parsed = {"status": "failed",
+                          "error": "transport_failed: " + str(exc)}
+        else:
+            parsed = {"status": "failed",
+                      "error": "transport_failed: " + str(failure)}
         with self.lock:
             # A terminal result may carry a compression-continuation ID that
             # differs from the turn's init ID. Prefer the parsed terminal ID;
@@ -155,18 +201,15 @@ class Turn:
                 if self.partial_reply is None and self.reply:
                     self.partial_reply = self.reply
                 self.reply = ""
-        try:
-            self._output.close()
-        except Exception:
-            pass
-        try:
-            self._errors.close()
-        except Exception:
-            pass
+        self._close_streams()
         self.done.set()
 
     def _run(self):
+        failure = None
         try:
+            # Encode before Popen so an invalid payload cannot leave a child
+            # blocked on stdin. Post-Popen failures still go through _reap.
+            payload = self.payload.encode("utf-8")
             self.proc = subprocess.Popen(
                 self.argv, stdin=subprocess.PIPE, stdout=self._output,
                 stderr=self._errors, env=self.env, cwd=self.cwd,
@@ -177,13 +220,10 @@ class Turn:
                 # A stop that won startup must not hand the child the task the
                 # caller already cancelled. Close stdin without the payload so
                 # the child sees EOF, then let the normal loop wait and reap it.
-                try:
-                    self.proc.stdin.close()
-                except (BrokenPipeError, OSError):
-                    pass
+                self._close_stdin()
             else:
                 try:
-                    self.proc.stdin.write(self.payload.encode("utf-8"))
+                    self.proc.stdin.write(payload)
                     self.proc.stdin.close()
                 except (BrokenPipeError, OSError):
                     pass
@@ -194,18 +234,14 @@ class Turn:
                 time.sleep(POLL_INTERVAL)
             self.exit_code = self.proc.returncode
             self._collect()
-            self._finish()
         except Exception as exc:
-            with self.lock:
-                self.error = "transport_failed: " + str(exc)
-                self.outcome = "failed"
-            for stream in (self._output, self._errors):
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+            failure = exc
+        finally:
+            # A failure before Popen must still release any started waiter.
             self.started.set()
-            self.done.set()
+        # The turn thread owns shutdown, reaping and publication on every path.
+        self._reap()
+        self._finish(failure)
 
     def interrupt(self, grace=None, kill_grace=None):
         """Claim and stop this turn. Return None if completion already won."""
@@ -215,11 +251,14 @@ class Turn:
         with self.lock:
             if self.done.is_set() or self.outcome is not None:
                 return None
-            if self.proc is not None and self.proc.poll() is not None:
-                # The process exited; let the turn thread publish completion.
-                self.done.wait(kill_grace)
-                return None
-            self.interrupted = True
+            leader_exited = self.proc is not None and self.proc.poll() is not None
+            if not leader_exited:
+                self.interrupted = True
+        if leader_exited:
+            # The process exited; let the turn thread publish completion. The
+            # completion path needs this same lock, so wait only after releasing it.
+            self.done.wait(kill_grace)
+            return None
         if not self.started.wait(grace):
             self.done.wait(kill_grace)
             with self.lock:
