@@ -2,8 +2,10 @@
 
 No HTTP listener, arbitrary RPC passthrough, or caller-supplied runtime session
 IDs. A task may open a fresh child session or resume one exact target-owned
-stored session. State is deliberately process-local and disappears with the
-owning process.
+stored session. The target-scoped ``session.resume`` RPC validates that the
+stored session exists in that profile and owns it; this module never reads the
+private session store. State is deliberately process-local and disappears with
+the owning process.
 """
 import atexit
 import contextvars
@@ -11,12 +13,10 @@ import importlib.util
 import json
 import os
 import queue
-import sqlite3
 import subprocess
 import sys
 import threading
 import uuid
-from contextlib import closing
 from pathlib import Path
 
 from . import ask_bot
@@ -179,18 +179,6 @@ def _ownership_refusal(exc):
     return exc.code in (4009, 4090) or reason == "SESSION_NOT_OWNED" or "SESSION_NOT_OWNED" in str(exc)
 
 
-def _target_session(root, target, session_id):
-    home = root if target == "default" else root / "profiles" / target
-    path = home / "state.db"
-    if not path.is_file():
-        return False
-    try:
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-            return db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is not None
-    except sqlite3.Error:
-        return False
-
-
 def _open_session(child, mode, requested_session_id):
     if mode == "new_session":
         return child.rpc("session.create", {"source": "bot_task", "title": "Bot task",
@@ -310,10 +298,8 @@ def handle(domains, args, **kwargs):
                 # Normalize only after the live ACL has accepted the canonical target.
                 target = args["target"].strip().removeprefix("@")
                 target = "default" if target == "hermes" else target
-                if mode == "resume":
-                    _, root = ask_bot.identity()
-                    if not _target_session(root, target, requested_session_id):
-                        raise ValueError("session_id not found in the target profile")
+                # Existence and ownership are validated by the target-scoped
+                # session.resume RPC in the child, not by reading its state.db.
                 active = [t for t in _TASKS.values() if t["status"] == "starting" or (t["child"] and not t["child"].closed)]
                 if len(active) >= 16 or sum(t["owner"] == owner for t in active) >= 4:
                     raise ValueError("active child task limit reached (4 per parent, 16 per process)")

@@ -1,11 +1,9 @@
 """bot_task spawn modes, unlimited runtime and ownership regressions (no model calls)."""
 import json
-import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
-from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -87,14 +85,6 @@ class StartModeTests(unittest.TestCase):
             tasks._start(task, 'mail', 'hello', mode, requested)
         return task
 
-    def recipient_session(self, target='mail', sid='target-session'):
-        home = self.root if target == 'default' else self.root / 'profiles' / target
-        with closing(sqlite3.connect(home / 'state.db')) as db:
-            db.execute('CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)')
-            db.execute('INSERT INTO sessions VALUES (?)', (sid,))
-            db.commit()
-        return sid
-
     def call(self, args, parent='parent'):
         return json.loads(tasks.handle({}, args, session_id=parent))
 
@@ -116,6 +106,8 @@ class StartModeTests(unittest.TestCase):
         self.assertNotIn('deadline_seconds', snapshot)
 
     def test_resume_uses_exact_target_session(self):
+        # No local state.db exists: the target-scoped RPC is the only validator.
+        self.assertFalse((self.root / 'profiles/mail/state.db').exists())
         fake = FakeChild({
             'session.resume': {'session_id': 'runtime', 'resumed': 'target-session'},
             'prompt.submit': {},
@@ -125,8 +117,35 @@ class StartModeTests(unittest.TestCase):
         methods = [m for m, _ in fake.calls]
         self.assertNotIn('session.create', methods)
         self.assertNotIn('session.list', methods)
+        self.assertEqual(methods.count('session.resume'), 1)
         self.assertEqual(fake.calls[1][1]['session_id'], 'target-session')
         self.assertEqual(tasks._snapshot(task)['requested_session_id'], 'target-session')
+
+    def test_resume_not_found_refusal_neither_prompts_nor_retries(self):
+        fake = FakeChild({
+            'session.resume': tasks.RPCError('session not found', code=4007),
+        })
+        task = self.start(fake, mode='resume', requested='valid-looking-session')
+        self.assertEqual(task['status'], 'failed_unknown')
+        methods = [m for m, _ in fake.calls]
+        self.assertEqual(methods.count('session.resume'), 1)
+        self.assertEqual(methods.count('session.create'), 0)
+        self.assertNotIn('prompt.submit', methods)
+        self.assertTrue(fake.closed)
+
+    def test_resume_ownership_refusal_is_target_busy_without_prompt_or_retry(self):
+        fake = FakeChild({
+            'session.resume': tasks.RPCError('recipient refused', code=4090,
+                                             data={'reason': 'SESSION_NOT_OWNED'}),
+        })
+        task = self.start(fake, mode='resume', requested='valid-looking-session')
+        self.assertEqual(task['status'], 'target_busy')
+        self.assertIn('resend', task['next_step'].lower())
+        methods = [m for m, _ in fake.calls]
+        self.assertEqual(methods.count('session.resume'), 1)
+        self.assertEqual(methods.count('session.create'), 0)
+        self.assertNotIn('prompt.submit', methods)
+        self.assertTrue(fake.closed)
 
     def test_ownership_refusal_is_target_busy_without_resend(self):
         fake = FakeChild({
@@ -158,31 +177,37 @@ class HandleValidationTests(unittest.TestCase):
     setUp = StartModeTests.setUp
     new_task = StartModeTests.new_task
     start = StartModeTests.start
-    recipient_session = StartModeTests.recipient_session
     call = StartModeTests.call
 
-    def test_resume_requires_target_owned_session(self):
-        self.recipient_session()
-        with patch.object(tasks, '_start') as start:
+    def test_resume_defers_existence_to_target_scoped_rpc(self):
+        # A valid-looking ID is admitted and handed to the child even though the
+        # target profile has no local state.db to probe.
+        self.assertFalse((self.root / 'profiles/mail/state.db').exists())
+        started = threading.Event()
+        forwarded = []
+
+        def start(*args):
+            forwarded.append(args)
+            started.set()
+
+        with patch.object(tasks, '_start', side_effect=start):
             result = self.call({'action': 'spawn', 'target': 'mail', 'message': 'hello',
-                                'mode': 'resume', 'session_id': 'target-session'})
+                                'mode': 'resume', 'session_id': 'valid-looking-session'})
             self.assertEqual(result['status'], 'starting')
-            start.assert_called_once()
-        for sid in ('missing-session', 'latest', 'LATEST', '--provider=evil', '../state', 'x;false'):
+            self.assertTrue(started.wait(1))
+        self.assertEqual(len(forwarded), 1)
+        _, target, text, mode, requested = forwarded[0]
+        self.assertEqual((target, text, mode, requested),
+                         ('mail', 'hello', 'resume', 'valid-looking-session'))
+
+    def test_resume_rejects_malformed_ids_before_spawn(self):
+        for sid in ('latest', 'LATEST', '--provider=evil', '../state', 'x;false',
+                    '', '   ', 'sess/child', 'a' * 129, None):
             with patch.object(tasks, '_start') as start:
                 result = self.call({'action': 'spawn', 'target': 'mail', 'message': 'hello',
                                     'mode': 'resume', 'session_id': sid})
                 self.assertEqual(result['status'], 'failed', sid)
                 start.assert_not_called()
-
-    def test_target_session_must_belong_to_target_profile(self):
-        self.recipient_session('coding', 'coding-session')
-        with patch.object(tasks, '_start') as start:
-            result = self.call({'action': 'spawn', 'target': 'mail', 'message': 'hello',
-                                'mode': 'resume', 'session_id': 'coding-session'})
-        self.assertEqual(result['status'], 'failed')
-        self.assertIn('not found in the target profile', result['error'])
-        start.assert_not_called()
 
     def test_session_id_only_with_resume(self):
         for mode in ('new_session', 'bot_chat'):
@@ -206,7 +231,6 @@ class HandleValidationTests(unittest.TestCase):
                 start.assert_not_called()
 
     def test_parent_and_resume_session_ids_stay_separate(self):
-        self.recipient_session()
         entered = threading.Event()
         def start(*args):
             entered.set()
@@ -226,6 +250,15 @@ class HandleValidationTests(unittest.TestCase):
                 patch.object(tasks, '_start') as start:
             result = self.call({'action': 'spawn', 'target': 'local', 'message': 'hello'})
         self.assertEqual(result['status'], 'blocked')
+        start.assert_not_called()
+
+    def test_acl_denial_prevents_resume_spawn(self):
+        with patch.object(tasks, 'check', return_value={'message': 'denied'}), \
+                patch.object(tasks, '_start') as start:
+            result = self.call({'action': 'spawn', 'target': 'local', 'message': 'hello',
+                                'mode': 'resume', 'session_id': 'valid-looking-session'})
+        self.assertEqual(result['status'], 'blocked')
+        self.assertIn('denied', result['error'])
         start.assert_not_called()
 
 

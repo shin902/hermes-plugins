@@ -16,9 +16,10 @@ spawn admits a task and returns without waiting for child readiness. A bounded
 startup thread retains the caller's contextvars. Spawn modes:
 
 - new_session (default): session.create.
-- resume: an exact target-owned stored session ID, checked read-only in the target
-  profile's state.db before launch, then session.resume. Titles, "latest" and IDs
-  belonging to another profile are rejected before a child starts.
+- resume: an exact target-owned stored session ID. Titles, "latest" and malformed
+  IDs are rejected lexically before a child starts; the target-scoped
+  session.resume RPC then validates existence and ownership before prompt.submit.
+  bot_task never reads the target profile's state.db or sessions table.
 
 No bot_chat mode: bot_task never looks up, creates, or continues a canonical Bot
 Chat. No caller timeout_seconds: the handler rejects that key explicitly,
@@ -52,9 +53,10 @@ event, preventing premature loss of backend-owned replay. It remains bounded by
 explicit stop. A stop racing with a follow-up that has already begun cannot
 retroactively prevent that execution.
 
-Ownership refusal during prompt.submit (SESSION_NOT_OWNED / code 4090 / busy)
-becomes target_busy with no automatic retry, resend or mode switch. Invalid resume
-IDs and other startup failures become failed_unknown.
+Ownership refusal during session.resume or prompt.submit (SESSION_NOT_OWNED /
+code 4090 / busy) becomes target_busy with no automatic retry, resend or mode
+switch. A public resume not-found refusal and other startup failures become
+failed_unknown. In both cases no prompt is submitted and the child is closed.
 
 No claim is made that accepted guidance was consumed at a live tool boundary.
 The returned backend result is preserved. No automatic resend is attempted.
