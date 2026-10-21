@@ -55,6 +55,9 @@ _TOOL_FAILURE_STATES: Final = frozenset(
 )
 DEFAULT_OPENCODE_BIN: Final = Path.home() / ".opencode" / "bin" / "opencode"
 _SESSION_ID_RE: Final = re.compile(r"^ses_[A-Za-z0-9]{1,120}$")
+# OpenCode emits ``step_finish`` only after a step ends normally, so it is
+# completion evidence even for a run that returns no final text.
+_COMPLETION_EVENT_TYPES: Final = frozenset({"step_finish"})
 
 
 class WorkerError(Exception):
@@ -217,6 +220,21 @@ def parse_events(stdout: str) -> tuple[list[dict[str, Any]], str, str, list[str]
     return events, (unique_sessions[0] if len(unique_sessions) == 1 else ""), "\n".join(texts), errors
 
 
+def _completion_observed(events: list[dict[str, Any]], text: str) -> bool:
+    """Whether this stream reached a final response or a completed step.
+
+    A session id or a successful tool event is not enough: OpenCode can emit
+    only an initial ``step_start`` (or a tool result) and still exit 0 after
+    the rest of the stream is lost. ``step_finish`` is emitted when a step ends
+    normally and covers successful runs that produce no final text.
+    """
+    if text.strip():
+        return True
+    return any(
+        event.get("type") in _COMPLETION_EVENT_TYPES for event in events
+    )
+
+
 def _terminate(process: subprocess.Popen[str]) -> None:
     """Stop the private OpenCode process group on timeout."""
     if process.poll() is not None:
@@ -290,7 +308,7 @@ def run_worker(
         raise
 
     duration = round(time.monotonic() - started, 3)
-    _, output_session, text, parse_errors = parse_events(stdout or "")
+    events, output_session, text, parse_errors = parse_events(stdout or "")
     actual_exit = None if timed_out else process.returncode
 
     error = ""
@@ -314,6 +332,11 @@ def run_worker(
             f"OpenCode returned session {output_session} instead of requested "
             f"session {session_id}; refusing to report a resumed turn"
         )
+        final_exit = 1
+    elif not _completion_observed(events, text):
+        # A session id, an initial step, or a successful tool event is partial
+        # stream evidence, not proof that the turn completed.
+        error = "OpenCode JSON output did not include a final response or completed step"
         final_exit = 1
 
     ok = not error

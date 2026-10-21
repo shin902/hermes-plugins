@@ -116,6 +116,10 @@ Example success shape:
   denial that leaves OpenCode's exit code and stdout looking successful.
 - Invalid JSON, a missing session id, or a mismatched resumed session id is a
   protocol failure with exit 1.
+- A stream that exits 0 without a final text response or a completed
+  `step_finish` event is a protocol failure with exit 1. An initial
+  `step_start`, a session id, or a successful tool event alone is not proof
+  that the turn completed.
 - Validation failures print a JSON error and exit 2.
 
 ## Boundaries

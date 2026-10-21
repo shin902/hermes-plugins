@@ -205,6 +205,69 @@ class OpenCodeWorkerTests(unittest.TestCase):
         self.assertEqual(report["session_id"], "ses_error0001")
         self.assertIn("error event", report["error"])
 
+    def test_session_only_stream_with_zero_exit_is_not_completed_work(self):
+        fake = self.fake_script(
+            "fake_session_only.py",
+            """
+            import json
+
+            print(json.dumps({"type": "step_start", "sessionID": "ses_partial001",
+                              "part": {"type": "step-start"}}))
+            """,
+        )
+
+        report = worker.run_worker(cwd=self.cwd, prompt="work", opencode_bin=fake)
+
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["opencode_exit_code"], 0)
+        self.assertEqual(report["session_id"], "ses_partial001")
+        self.assertEqual(report["text"], "")
+        self.assertIn("final response or completed step", report["error"])
+
+    def test_completed_tool_without_final_response_is_a_partial_stream(self):
+        fake = self.fake_script(
+            "fake_tool_only.py",
+            """
+            import json
+
+            print(json.dumps({"type": "step_start", "sessionID": "ses_partial002",
+                              "part": {"type": "step-start"}}))
+            print(json.dumps({"type": "tool_use", "sessionID": "ses_partial002",
+                              "part": {"type": "tool", "tool": "read",
+                                       "state": {"status": "completed",
+                                                 "output": "ok"}}}))
+            """,
+        )
+
+        report = worker.run_worker(cwd=self.cwd, prompt="read", opencode_bin=fake)
+
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["opencode_exit_code"], 0)
+        self.assertEqual(report["session_id"], "ses_partial002")
+        self.assertIn("final response or completed step", report["error"])
+
+    def test_completed_step_without_final_text_is_a_success(self):
+        fake = self.fake_script(
+            "fake_step_finish.py",
+            """
+            import json
+
+            print(json.dumps({"type": "step_start", "sessionID": "ses_finish001",
+                              "part": {"type": "step-start"}}))
+            print(json.dumps({"type": "step_finish", "sessionID": "ses_finish001",
+                              "part": {"type": "step-finish", "reason": "stop"}}))
+            """,
+        )
+
+        report = worker.run_worker(cwd=self.cwd, prompt="work", opencode_bin=fake)
+
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["exit_code"], 0)
+        self.assertEqual(report["session_id"], "ses_finish001")
+        self.assertEqual(report["text"], "")
+
     def test_tool_state_error_with_zero_exit_is_a_failure(self):
         fake = self.fake_script(
             "fake_tool_error.py",
