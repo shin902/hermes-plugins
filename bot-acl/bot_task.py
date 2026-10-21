@@ -174,11 +174,19 @@ class Turn:
             self.started.set()
             if self._cancel_requested.is_set():
                 ask_bot._signal_group(self.proc, signal.SIGTERM)
-            try:
-                self.proc.stdin.write(self.payload.encode("utf-8"))
-                self.proc.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
+                # A stop that won startup must not hand the child the task the
+                # caller already cancelled. Close stdin without the payload so
+                # the child sees EOF, then let the normal loop wait and reap it.
+                try:
+                    self.proc.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            else:
+                try:
+                    self.proc.stdin.write(self.payload.encode("utf-8"))
+                    self.proc.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
             while True:
                 self._collect()
                 if self.proc.poll() is not None:

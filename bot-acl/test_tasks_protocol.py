@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -64,6 +65,41 @@ class TurnIntegrationTests(unittest.TestCase):
         self.assertEqual(turn.session_id, '20260101_000000_abcdef')
         self.assertEqual(turn.partial_reply, 'interrupted partial')
         self.assertFalse(turn.forced)
+
+    def test_cancelled_startup_sends_no_prompt_and_reaps_child(self):
+        real_popen = subprocess.Popen
+        ready, entered, release = (self.root / 'ready', threading.Event(),
+                                   threading.Event())
+
+        def ready_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            deadline = time.monotonic() + 5
+            while not ready.exists() and proc.poll() is None:
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(.01)
+            entered.set()
+            release.wait(5)
+            return proc
+
+        with patch.object(tasks.subprocess, 'Popen', side_effect=ready_popen):
+            turn = self.turn('startup', payload='SECRET-PAYLOAD',
+                             FAKE_CLI_READY=str(ready))
+            self.assertTrue(entered.wait(5))
+            interrupter = threading.Thread(
+                target=turn.interrupt, kwargs={'grace': 5, 'kill_grace': 5})
+            interrupter.start()
+            self.assertTrue(turn._cancel_requested.wait(5))
+            release.set()
+            interrupter.join(10)
+        self.assertTrue(turn.done.wait(5))
+        self.assertFalse(interrupter.is_alive())
+        self.assertEqual(turn.exit_code, 0)
+        self.assertIsNotNone(turn.proc.poll(), 'child was not reaped')
+        starts = [event for event in read_events(self.log) if event['event'] == 'start']
+        self.assertEqual([event['prompt'] for event in starts], [''])
+        self.assertNotIn('SECRET-PAYLOAD', self.log.read_text(encoding='utf-8'))
+        self.assertFalse(self.alive(turn.proc.pid))
 
     def test_forced_kill_marks_persistence_unknown(self):
         with patch.object(tasks, 'SHUTDOWN_GRACE', .2), patch.object(tasks, 'KILL_GRACE', 1.0):

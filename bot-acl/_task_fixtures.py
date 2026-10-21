@@ -18,6 +18,18 @@ mode = os.environ.get("FAKE_CLI_MODE", "complete")
 sid = os.environ.get("FAKE_CLI_SESSION_ID", "20260101_000000_abcdef")
 resume = next((arg.split("=", 1)[1] for arg in argv if arg.startswith("--resume=")), None)
 target = argv[argv.index("-p") + 1] if "-p" in argv else None
+if mode == "startup":
+    # Startup-cancellation probe: ignore the early SIGTERM, announce readiness,
+    # record exactly what arrived on stdin, then exit so the parent can reap it.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    ready = os.environ.get("FAKE_CLI_READY")
+    if ready:
+        open(ready, "w", encoding="utf-8").close()
+    prompt = sys.stdin.read()
+    log({"event": "start", "pid": os.getpid(), "argv": argv, "target": target,
+         "resume": resume, "prompt": prompt, "home": os.environ.get("HERMES_HOME")})
+    log({"event": "end", "pid": os.getpid(), "status": "startup"})
+    sys.exit(0)
 prompt = sys.stdin.read()
 log({"event": "start", "pid": os.getpid(), "argv": argv, "target": target,
      "resume": resume, "prompt": prompt, "home": os.environ.get("HERMES_HOME")})
