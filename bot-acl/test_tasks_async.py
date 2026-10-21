@@ -38,6 +38,67 @@ class AsyncTests(TaskTests):
         # _launch itself refuses a cancelled task without creating a turn.
         self.assertIsNone(tasks._TASKS['t']['turn'])
 
+    def test_shutdown_cancels_pending_initial_launch(self):
+        task = tasks._TASKS['t']
+        task['turn'] = None
+        task['status'] = 'starting'
+        entered = threading.Event()
+        released = threading.Event()
+        started = []
+
+        real_launch = tasks._launch
+
+        def launch(*args, **kwargs):
+            entered.set()
+            released.wait(2)
+            started.append(real_launch(*args, **kwargs))
+
+        with patch.object(tasks, '_launch', side_effect=launch):
+            thread = threading.Thread(target=tasks._start,
+                args=(task, 'mail', 'initial task', 'new_session', None))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                tasks.shutdown()
+            finally:
+                released.set()
+                thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(task['stop'].is_set())
+        self.assertEqual(started, [None])
+        self.assertIsNone(task['turn'])
+
+    def test_shutdown_cancels_steer_handoff_replacement(self):
+        task = tasks._TASKS['t']
+        task['session_id'] = 'runtime'
+        entered = threading.Event()
+        released = threading.Event()
+        steered = []
+        real_launch = tasks._launch
+
+        def launch(*args, **kwargs):
+            entered.set()
+            released.wait(2)
+            return real_launch(*args, **kwargs)
+
+        with patch.object(tasks, '_launch', side_effect=launch):
+            thread = threading.Thread(target=lambda: steered.append(
+                tasks._steer(task, {}, 'replacement guidance')))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(self.turn.done.is_set())
+                tasks.shutdown()
+            finally:
+                released.set()
+                thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(task['stop'].is_set())
+        self.assertIs(task['turn'], self.turn)
+        self.assertEqual(steered[0]['steer_status'], 'stopped')
+
     def test_stop_without_turn_preserves_settled_startup_failure(self):
         self._add_task('failed', 'failed_unknown', None)
         tasks._TASKS['failed']['error'] = 'session_id not found in target profile'

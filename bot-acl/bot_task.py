@@ -676,6 +676,11 @@ def handle(domains, args, **kwargs):
 def shutdown():
     with _LOCK:
         tasks = list(_TASKS.values())
+    # Publish cancellation to every task before waiting on any live turn. A
+    # pending initial launch or steer handoff observes this existing stop
+    # event and cannot install a replacement turn after shutdown begins.
+    for task in tasks:
+        task["stop"].set()
     for task in tasks:
         turn = task.get("turn")
         if turn is not None and not turn.done.is_set():
