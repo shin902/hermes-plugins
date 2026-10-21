@@ -42,6 +42,14 @@ class OpenCodeWorkerTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
+    def run_events(self, name: str, events: list[dict]) -> dict:
+        body = "import json\n" + "\n".join(
+            f"print(json.dumps({event!r}))" for event in events
+        )
+        return worker.run_worker(
+            cwd=self.cwd, prompt="work", opencode_bin=self.fake_script(name, body)
+        )
+
     def test_argv_pins_model_and_standalone(self):
         argv = worker.build_argv(
             opencode_bin=Path("/opt/opencode"), prompt="do work", session_id="ses_abc123"
@@ -84,6 +92,8 @@ class OpenCodeWorkerTests(unittest.TestCase):
                               "part": {"type": "text", "text": json.dumps({
                                   "cwd": os.getcwd(), "pwd": os.environ.get("PWD"),
                                   "model": model, "auto": "--auto" in argv})}}))
+            print(json.dumps({"type": "step_finish", "sessionID": session,
+                              "part": {"type": "step-finish", "reason": "stop"}}))
             """,
         )
 
@@ -108,8 +118,12 @@ class OpenCodeWorkerTests(unittest.TestCase):
 
             argv = sys.argv[1:]
             session = argv[argv.index("--session") + 1]
+            print(json.dumps({"type": "step_start", "sessionID": session,
+                              "part": {"type": "step-start"}}))
             print(json.dumps({"type": "text", "sessionID": session,
                               "part": {"type": "text", "text": "RESUMED"}}))
+            print(json.dumps({"type": "step_finish", "sessionID": session,
+                              "part": {"type": "step-finish", "reason": "stop"}}))
             """,
         )
 
@@ -223,7 +237,7 @@ class OpenCodeWorkerTests(unittest.TestCase):
         self.assertEqual(report["opencode_exit_code"], 0)
         self.assertEqual(report["session_id"], "ses_partial001")
         self.assertEqual(report["text"], "")
-        self.assertIn("final response or completed step", report["error"])
+        self.assertIn("terminal step finish", report["error"])
 
     def test_completed_tool_without_final_response_is_a_partial_stream(self):
         fake = self.fake_script(
@@ -246,7 +260,7 @@ class OpenCodeWorkerTests(unittest.TestCase):
         self.assertEqual(report["exit_code"], 1)
         self.assertEqual(report["opencode_exit_code"], 0)
         self.assertEqual(report["session_id"], "ses_partial002")
-        self.assertIn("final response or completed step", report["error"])
+        self.assertIn("terminal step finish", report["error"])
 
     def test_completed_step_without_final_text_is_a_success(self):
         fake = self.fake_script(
@@ -267,6 +281,118 @@ class OpenCodeWorkerTests(unittest.TestCase):
         self.assertEqual(report["exit_code"], 0)
         self.assertEqual(report["session_id"], "ses_finish001")
         self.assertEqual(report["text"], "")
+
+    def test_tool_calls_finish_followed_by_step_start_is_not_completed(self):
+        report = self.run_events(
+            "fake_tool_calls_then_step_start.py",
+            [
+                {"type": "step_start", "sessionID": "ses_transition01",
+                 "part": {"type": "step-start"}},
+                {"type": "tool_use", "sessionID": "ses_transition01",
+                 "part": {"type": "tool", "tool": "read",
+                          "state": {"status": "completed", "output": "ok"}}},
+                {"type": "step_finish", "sessionID": "ses_transition01",
+                 "part": {"type": "step-finish", "reason": "tool-calls"}},
+                {"type": "step_start", "sessionID": "ses_transition01",
+                 "part": {"type": "step-start"}},
+            ],
+        )
+
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["opencode_exit_code"], 0)
+        self.assertEqual(report["session_id"], "ses_transition01")
+        self.assertIn("terminal step finish", report["error"])
+
+    def test_intermediate_text_then_truncation_is_not_completed(self):
+        report = self.run_events(
+            "fake_intermediate_text.py",
+            [
+                {"type": "step_start", "sessionID": "ses_transition02",
+                 "part": {"type": "step-start"}},
+                {"type": "text", "sessionID": "ses_transition02",
+                 "part": {"type": "text", "text": "Working on the first part."}},
+            ],
+        )
+
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["opencode_exit_code"], 0)
+        self.assertTrue(report["text"].strip())
+        self.assertIn("terminal step finish", report["error"])
+
+    def test_earlier_terminal_finish_followed_by_unfinished_step_is_not_completed(self):
+        report = self.run_events(
+            "fake_terminal_then_step_start.py",
+            [
+                {"type": "step_start", "sessionID": "ses_transition03",
+                 "part": {"type": "step-start"}},
+                {"type": "text", "sessionID": "ses_transition03",
+                 "part": {"type": "text", "text": "First step finished."}},
+                {"type": "step_finish", "sessionID": "ses_transition03",
+                 "part": {"type": "step-finish", "reason": "stop"}},
+                {"type": "step_start", "sessionID": "ses_transition03",
+                 "part": {"type": "step-start"}},
+            ],
+        )
+
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["exit_code"], 1)
+        self.assertEqual(report["opencode_exit_code"], 0)
+        self.assertIn("terminal step finish", report["error"])
+
+    def test_multi_step_tool_run_with_terminal_stop_is_a_success(self):
+        report = self.run_events(
+            "fake_multi_step_success.py",
+            [
+                {"type": "step_start", "sessionID": "ses_transition04",
+                 "part": {"type": "step-start"}},
+                {"type": "tool_use", "sessionID": "ses_transition04",
+                 "part": {"type": "tool", "tool": "read",
+                          "state": {"status": "completed", "output": "ok"}}},
+                {"type": "step_finish", "sessionID": "ses_transition04",
+                 "part": {"type": "step-finish", "reason": "tool-calls"}},
+                {"type": "step_start", "sessionID": "ses_transition04",
+                 "part": {"type": "step-start"}},
+                {"type": "text", "sessionID": "ses_transition04",
+                 "part": {"type": "text", "text": "DONE"}},
+                {"type": "step_finish", "sessionID": "ses_transition04",
+                 "part": {"type": "step-finish", "reason": "stop"}},
+            ],
+        )
+
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["exit_code"], 0)
+        self.assertEqual(report["session_id"], "ses_transition04")
+        self.assertEqual(report["text"], "DONE")
+
+    def test_nonterminal_or_missing_finish_reasons_are_not_completed(self):
+        cases = [
+            ("length", {"type": "step-finish", "reason": "length"}),
+            ("content-filter", {"type": "step-finish", "reason": "content-filter"}),
+            ("error", {"type": "step-finish", "reason": "error"}),
+            ("unknown", {"type": "step-finish", "reason": "unknown"}),
+            ("tool-calls", {"type": "step-finish", "reason": "tool-calls"}),
+            ("missing", {"type": "step-finish"}),
+            ("non-string", {"type": "step-finish", "reason": None}),
+        ]
+        for name, part in cases:
+            with self.subTest(reason=name):
+                report = self.run_events(
+                    f"fake_finish_{name.replace('-', '_')}.py",
+                    [
+                        {"type": "step_start", "sessionID": "ses_transition05",
+                         "part": {"type": "step-start"}},
+                        {"type": "text", "sessionID": "ses_transition05",
+                         "part": {"type": "text", "text": "Partial output."}},
+                        {"type": "step_finish", "sessionID": "ses_transition05",
+                         "part": part},
+                    ],
+                )
+
+                self.assertFalse(report["ok"], report)
+                self.assertEqual(report["exit_code"], 1)
+                self.assertIn("terminal step finish", report["error"])
 
     def test_tool_state_error_with_zero_exit_is_a_failure(self):
         fake = self.fake_script(
@@ -303,6 +429,8 @@ class OpenCodeWorkerTests(unittest.TestCase):
             print(json.dumps({"type": "tool_use", "sessionID": "ses_tooldeny01",
                               "part": {"type": "tool", "tool": "edit",
                                        "state": {"status": "denied"}}}))
+            print(json.dumps({"type": "step_finish", "sessionID": "ses_tooldeny01",
+                              "part": {"type": "step-finish", "reason": "stop"}}))
             """,
         )
 
@@ -320,12 +448,16 @@ class OpenCodeWorkerTests(unittest.TestCase):
             """
             import json
 
+            print(json.dumps({"type": "step_start", "sessionID": "ses_toolok01",
+                              "part": {"type": "step-start"}}))
             print(json.dumps({"type": "tool_use", "sessionID": "ses_toolok01",
                               "part": {"type": "tool", "tool": "read",
                                        "state": {"status": "completed",
                                                  "output": "ok"}}}))
             print(json.dumps({"type": "text", "sessionID": "ses_toolok01",
                               "part": {"type": "text", "text": "DONE"}}))
+            print(json.dumps({"type": "step_finish", "sessionID": "ses_toolok01",
+                              "part": {"type": "step-finish", "reason": "stop"}}))
             """,
         )
 

@@ -116,10 +116,15 @@ Example success shape:
   denial that leaves OpenCode's exit code and stdout looking successful.
 - Invalid JSON, a missing session id, or a mismatched resumed session id is a
   protocol failure with exit 1.
-- A stream that exits 0 without a final text response or a completed
-  `step_finish` event is a protocol failure with exit 1. An initial
-  `step_start`, a session id, or a successful tool event alone is not proof
-  that the turn completed.
+- A stream that exits 0 without a terminal `step_finish` whose
+  `part.reason` is `stop` is a protocol failure with exit 1. OpenCode's finish
+  reasons are `stop`, `length`, `tool-calls`, `content-filter`, `error`, and
+  `unknown`; only `stop` is terminal success. `tool-calls` is a continuation,
+  `length` is truncation, `content-filter`/`error` are failures, and
+  `unknown` or a missing reason is not proof of completion. Text parts, an
+  initial `step_start`, a session id, or a successful tool event are not
+  completion evidence. A later `step_start` clears an earlier terminal finish,
+  so a completed step cannot mask a later unfinished one.
 - Validation failures print a JSON error and exit 2.
 
 ## Boundaries

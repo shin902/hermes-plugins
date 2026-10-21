@@ -55,9 +55,11 @@ _TOOL_FAILURE_STATES: Final = frozenset(
 )
 DEFAULT_OPENCODE_BIN: Final = Path.home() / ".opencode" / "bin" / "opencode"
 _SESSION_ID_RE: Final = re.compile(r"^ses_[A-Za-z0-9]{1,120}$")
-# OpenCode emits ``step_finish`` only after a step ends normally, so it is
-# completion evidence even for a run that returns no final text.
-_COMPLETION_EVENT_TYPES: Final = frozenset({"step_finish"})
+# OpenCode's step-finish reason schema is stop, length, tool-calls,
+# content-filter, error, or unknown. Only ``stop`` is terminal success:
+# ``tool-calls`` continues the run, ``length``/``content-filter``/``error`` are
+# failures, and ``unknown``/missing is not proof that the step completed.
+_TERMINAL_FINISH_REASONS: Final = frozenset({"stop"})
 
 
 class WorkerError(Exception):
@@ -220,19 +222,29 @@ def parse_events(stdout: str) -> tuple[list[dict[str, Any]], str, str, list[str]
     return events, (unique_sessions[0] if len(unique_sessions) == 1 else ""), "\n".join(texts), errors
 
 
-def _completion_observed(events: list[dict[str, Any]], text: str) -> bool:
-    """Whether this stream reached a final response or a completed step.
+def _finish_reason(event: dict[str, Any]) -> str:
+    part = event.get("part")
+    if not isinstance(part, dict):
+        return ""
+    reason = part.get("reason")
+    return reason if isinstance(reason, str) else ""
 
-    A session id or a successful tool event is not enough: OpenCode can emit
-    only an initial ``step_start`` (or a tool result) and still exit 0 after
-    the rest of the stream is lost. ``step_finish`` is emitted when a step ends
-    normally and covers successful runs that produce no final text.
+
+def _completion_observed(events: list[dict[str, Any]]) -> bool:
+    """Whether the last OpenCode step ended with a terminal finish reason.
+
+    Text parts are not completion evidence: a step can emit intermediate text
+    and still be truncated. A later ``step_start`` clears an earlier terminal
+    finish, so a completed step cannot mask a later unfinished one.
     """
-    if text.strip():
-        return True
-    return any(
-        event.get("type") in _COMPLETION_EVENT_TYPES for event in events
-    )
+    completed = False
+    for event in events:
+        event_type = event.get("type")
+        if event_type == "step_start":
+            completed = False
+        elif event_type == "step_finish":
+            completed = _finish_reason(event) in _TERMINAL_FINISH_REASONS
+    return completed
 
 
 def _terminate(process: subprocess.Popen[str]) -> None:
@@ -333,10 +345,10 @@ def run_worker(
             f"session {session_id}; refusing to report a resumed turn"
         )
         final_exit = 1
-    elif not _completion_observed(events, text):
-        # A session id, an initial step, or a successful tool event is partial
-        # stream evidence, not proof that the turn completed.
-        error = "OpenCode JSON output did not include a final response or completed step"
+    elif not _completion_observed(events):
+        # A session id, text, an initial step, or a successful tool event is
+        # partial stream evidence, not proof that the turn completed.
+        error = "OpenCode JSON output did not include a terminal step finish with reason 'stop'"
         final_exit = 1
 
     ok = not error
