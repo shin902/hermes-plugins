@@ -118,7 +118,7 @@ class TaskCliTests(unittest.TestCase):
         self.assertIn('chat', argv)
         self.assertEqual(argv[argv.index('--query-file') + 1], '-')
         self.assertEqual(argv[argv.index('--format') + 1], 'stream-json')
-        self.assertEqual(argv[argv.index('--source') + 1], 'bot_task')
+        self.assertEqual(argv[argv.index('--source') + 1], 'cli')
         self.assertEqual(argv[argv.index('--run-budget') + 1], '0')
         self.assertEqual(argv[argv.index('--max-turns') + 1], '250')
         self.assertNotIn('--continue', argv)

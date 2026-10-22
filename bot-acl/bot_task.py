@@ -314,7 +314,7 @@ def _launch(task, target, text, mode, session_id, source, reason):
     _, root = _source_and_root()
     target_home = _target_home(root, target)
     env, scratch = ask_bot._child_env(target_home)
-    argv = ask_bot._cli_argv(executable, target, mode, session_id, "bot_task")
+    argv = ask_bot._cli_argv(executable, target, mode, session_id)
     payload = ask_bot._payload(source, text, task=(reason != "steer"),
                                steer=(reason == "steer"))
     turn = Turn(argv, payload, env, Path.home(), scratch, target, mode, session_id)

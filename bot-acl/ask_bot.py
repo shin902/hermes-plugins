@@ -148,9 +148,10 @@ def _child_env(target_home):
     return env, scratch
 
 
-def _cli_argv(executable, target, mode, session_id, source):
+def _cli_argv(executable, target, mode, session_id):
     argv = [executable, "-p", target, "chat", "--in", str(Path.home()),
-            "--query-file", "-", "--format", "stream-json", "--source", source,
+            # Gateway accepts fixed surface labels; cli keeps consultations visible.
+            "--query-file", "-", "--format", "stream-json", "--source", "cli",
             "--run-budget", "0", "--max-turns", str(MAX_TURNS)]
     if mode == "resume":
         argv += ["--resume=" + session_id]
@@ -376,7 +377,7 @@ def _ask(domains, args, **kwargs):
             _require_exact_session_id(target_home, session_id)
             _audit(session_id=session_id)
         env, scratch = _child_env(target_home)
-        argv = _cli_argv(executable, target, mode, session_id, "ask_bot")
+        argv = _cli_argv(executable, target, mode, session_id)
         payload = _payload(source, message)
         state = _AUDIT.get()
         request_id = state['record']['request_id'] if state else uuid.uuid4().hex

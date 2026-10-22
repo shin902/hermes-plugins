@@ -37,7 +37,7 @@ Both tools use only the public CLI surface:
 
 ```text
 hermes -p <target> chat --in <home> --query-file - --format stream-json \
-  --source <ask_bot|bot_task> --run-budget 0 --max-turns 250 [--resume=<exact-id>]
+  --source cli --run-budget 0 --max-turns 250 [--resume=<exact-id>]
 ```
 
 Each `bot_task` turn is one such subprocess. There is no TUI stdio JSON-RPC gateway, HTTP listener, shared gateway mutation, or arbitrary RPC passthrough. Target profile isolation uses `-p <target>`, `HERMES_HOME`, and removal of inherited TUI/profile/session environment variables. Child tasks are started asynchronously and are parent-owned; a parent can list only its own tasks, active-task limits are preserved, and the startup thread retains caller context. Nested child tasks are disabled. Transport failure, cancellation, and explicit partial results are never reported as completed replies.

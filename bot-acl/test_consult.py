@@ -52,7 +52,7 @@ class ConsultTests(unittest.TestCase):
         self.assertEqual(argv[:4],['/cli/hermes','-p','mail','chat'])
         self.assertNotIn('--continue',argv)
         self.assertIn('--format',argv)
-        self.assertEqual(argv[argv.index('--source')+1], 'ask_bot')
+        self.assertEqual(argv[argv.index('--source')+1], 'cli')
         self.assertEqual(argv[argv.index('--query-file')+1],'-')
         self.assertIn(self.args['message'],payload)
         self.assertIn('@coding',payload)
