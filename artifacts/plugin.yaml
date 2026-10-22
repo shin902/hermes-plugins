@@ -1,0 +1,5 @@
+name: artifacts
+version: 1.0.0
+description: Register HTML and Markdown folders on the personal Tailnet artifacts site
+provides_tools:
+  - artifact_register
