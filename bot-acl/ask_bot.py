@@ -136,6 +136,52 @@ def _require_exact_session_id(target_home, session_id):
         raise ValueError("session_id not found in target profile") from exc
 
 
+BOT_MARK = "🤖"
+# SessionDB.MAX_TITLE_LENGTH: a longer rename is refused by the store, so the
+# marker truncates instead of losing the whole title.
+TITLE_LIMIT = 100
+
+
+def _stored_title(target_home, session_id):
+    """Read a stored session title (read-only), or None when unreadable/absent.
+
+    Same documented internal storage dependency as the exact-ID probe above.
+    """
+    path = Path(target_home) / "state.db"
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+            row = db.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return (row[0] or "").strip() if row else None
+
+
+def mark_session(root, target, session_id):
+    """Prefix a bot-started session's title with the bot marker.
+
+    The title is the one field every surface already renders — Desktop sidebar,
+    TUI, ``sessions list`` — and a "user" title is the only provenance the
+    auto-titler cannot overwrite later. Rename through the public CLI, never by
+    writing the store directly. Best effort: no consultation result depends on
+    this decoration, so every failure is logged and swallowed.
+    """
+    executable = _executable()
+    if not executable or not _valid_id(session_id):
+        return
+    try:
+        target_home = _target_home(root, target)
+        title = _stored_title(target_home, session_id)
+        if not title or title.startswith(BOT_MARK):
+            return
+        marked = f"{BOT_MARK} {title}"[:TITLE_LIMIT].rstrip()
+        env, _ = _child_env(target_home)
+        subprocess.run([executable, "-p", target, "sessions", "rename", session_id, marked],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, env=env, cwd=str(Path.home()), timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.getLogger(__name__).warning("bot-acl: could not mark session %s: %s", session_id, exc)
+
+
 def _child_env(target_home):
     env = dict(os.environ)
     env["HERMES_HOME"] = str(target_home)
@@ -391,6 +437,7 @@ def _ask(domains, args, **kwargs):
         outcome = _outcome(code, output, errors, timed_out, target, mode)
         if mode == "resume" and not outcome.get("session_id"):
             outcome["session_id"] = session_id
+        mark_session(root, target, outcome.get("session_id"))
         return json.dumps(outcome, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"status": "failed", "resident": False, "error": str(exc)}, ensure_ascii=False)

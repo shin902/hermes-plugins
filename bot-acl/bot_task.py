@@ -201,6 +201,8 @@ class Turn:
                 if self.partial_reply is None and self.reply:
                     self.partial_reply = self.reply
                 self.reply = ""
+        _, root = _source_and_root()
+        ask_bot.mark_session(root, self.target, self.session_id)
         self._close_streams()
         self.done.set()
 

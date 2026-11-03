@@ -329,3 +329,30 @@ class ConsultTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 consult._run(['/cli/hermes'],'test',dict(os.environ),5,self.root)
             stop.assert_called_once_with(proc)
+
+    def store_title(self, title, sid='test-recipient'):
+        home = self.root / 'profiles' / 'mail'
+        with closing(sqlite3.connect(home / 'state.db')) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT)')
+            db.execute('INSERT OR REPLACE INTO sessions VALUES (?,?)', (sid, title))
+            db.commit()
+        return sid
+
+    def test_consultation_session_gets_the_bot_marker(self):
+        sid = self.store_title('A literal question')
+        with patch.object(consult.subprocess,'run') as run:
+            result,_ = self.call()
+        self.assertEqual(result['status'],'completed')
+        self.assertEqual(run.call_args.args[0],
+                         ['/cli/hermes','-p','mail','sessions','rename',sid,'\U0001F916 A literal question'])
+
+    def test_bot_marker_is_idempotent_and_never_breaks_a_consultation(self):
+        self.store_title('\U0001F916 Already marked')
+        with patch.object(consult.subprocess,'run') as run:
+            self.call()
+        run.assert_not_called()
+        self.store_title('Fresh title')
+        with patch.object(consult.subprocess,'run',side_effect=OSError('no cli')):
+            result,_ = self.call()
+        self.assertEqual(result['status'],'completed')
+        self.assertEqual(result['reply'],'Actual transport fixture reply')

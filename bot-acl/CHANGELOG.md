@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1
+
+- Prefix a bot started session's title with `🤖` after the turn, so a consultation or task session is recognisable in the Desktop sidebar, the TUI and `sessions list`.
+- Rename through the public `sessions rename` CLI: a user-provenance title survives the auto-title upgrade, and no store write is added.
+- Marking is best effort and idempotent. A missing title, an unreadable store, an already marked title, or a failing CLI leaves the consultation result untouched.
+- Read the stored title with the same read-only `sessions` probe the exact-ID resume check already uses.
+
 ## 0.7.0
 
 - Replace the `bot_task` TUI stdio JSON-RPC backend with one public `hermes -p <target> chat --query-file - --format stream-json` subprocess per turn, always with `--run-budget 0` and `--max-turns 250`.

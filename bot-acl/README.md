@@ -31,6 +31,10 @@ There is no `bot_chat` mode and no canonical Bot Chat creation or continuation. 
 
 `steer` interrupts the active public CLI turn with `SIGTERM`, waits for the predecessor process group to exit, and then resumes the same returned `session_id` in the same target profile with only the new guidance. The original prompt is never resent. A completed turn cannot be steered: `steer` returns `not_applied_completed` and sends nothing. If shutdown requires a bounded `SIGKILL`, persistence is uncertain and automatic resume is blocked (`blocked_forced_kill`). If the interrupted turn returned no `session_id`, resume is also blocked (`blocked_no_session_id`). Stop sets a race flag before waiting for an in-flight steer, so a later steer cannot start a new writer; multiple steers are serialized by the task lock.
 
+### Session marker
+
+A session started by `ask_bot` or `bot_task` is renamed to `🤖 <title>` once its turn settles, so a human can tell a bot-started session from one they typed in the Desktop sidebar, the TUI, and `sessions list`. The rename goes through the public `sessions rename` CLI, whose `user` title provenance the auto-titler cannot overwrite. Marking is best effort and idempotent: it is skipped when the stored title is already marked, and a failure is logged without changing the tool result.
+
 ### Transport
 
 Both tools use only the public CLI surface:
