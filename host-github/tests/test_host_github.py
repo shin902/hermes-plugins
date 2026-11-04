@@ -1,11 +1,21 @@
 import json
 import subprocess
 import sys
+import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
 import importlib.util
 from pathlib import Path
+
+# The plugin resolves the profile home through the Hermes runtime; stand it in for tests.
+_PROFILE_HOME = tempfile.mkdtemp(prefix="host-github-home-")
+sys.modules.setdefault("hermes_constants", types.SimpleNamespace(
+    get_hermes_home=lambda: _PROFILE_HOME,
+    get_default_hermes_root=lambda: Path(_PROFILE_HOME).parent,
+    profile_name_for_home=lambda _: "default",
+))
 
 _spec = importlib.util.spec_from_file_location("host_github", Path(__file__).parents[1] / "host_github.py")
 hg = importlib.util.module_from_spec(_spec)

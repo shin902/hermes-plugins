@@ -1,9 +1,10 @@
-"""Bounded host-side GitHub CLI tool for the coding profile."""
+"""Bounded host-side GitHub CLI tool."""
 from __future__ import annotations
 
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 GH = "/usr/bin/gh"
-CWD = "/home/shi/.hermes/profiles/coding"
+GIT = "/usr/bin/git"
 TIMEOUT = 20
 MAX_OUTPUT = 1_000_000
 MAX_TEXT = 20_000
@@ -21,6 +22,8 @@ ACTIONS = {
     "repo_view", "pr_list", "pr_view", "pr_diff", "pr_checks", "issue_list", "issue_view",
     "run_list", "run_view", "pr_create", "issue_create",
 }
+GIT_ACTIONS = {"git_status", "git_diff", "git_log", "git_add", "git_commit", "git_fetch", "git_push"}
+ACTIONS |= GIT_ACTIONS
 COMMON = {"limit"}
 BY_ACTION = {
     "repo_view": set(), "pr_list": COMMON | {"state", "head", "base"},
@@ -30,6 +33,12 @@ BY_ACTION = {
     "pr_create": {"title", "body", "head", "base", "draft", "confirm"},
     "issue_create": {"title", "body", "labels", "assignees", "confirm"},
 }
+BY_ACTION.update({
+    "git_status": {"cwd"}, "git_diff": {"cwd", "staged"},
+    "git_log": {"cwd", "limit"}, "git_add": {"cwd", "paths"},
+    "git_commit": {"cwd", "message"},
+    "git_fetch": {"cwd", "branch"}, "git_push": {"cwd", "branch"},
+})
 WRITE = {"pr_create", "issue_create"}
 RUN_STATUSES = {
     "queued", "completed", "in_progress", "requested", "waiting", "pending",
@@ -51,9 +60,15 @@ REQUIRED_BY_ACTION = {
     "issue_create": ["title", "body", "confirm"],
 }
 
+REQUIRED_BY_ACTION.update({
+    "git_status": ["cwd"], "git_diff": ["cwd"], "git_log": ["cwd"],
+    "git_add": ["cwd", "paths"], "git_commit": ["cwd", "message"],
+    "git_fetch": ["cwd", "branch"], "git_push": ["cwd", "branch"],
+})
+
 SCHEMA = {
     "name": "host_github",
-    "description": "Read GitHub repositories, pull requests, issues, and Actions runs. Create PRs/issues only with confirm=true. Repository is always explicit owner/name.",
+    "description": "Host Git and GitHub using existing host identity/auth. Git actions use an explicit absolute host cwd without an approval prompt; fetch/push target the explicit GitHub owner/name and branch. PR/issue creation requires confirm=true.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -69,6 +84,9 @@ SCHEMA = {
                 "body": {"type": "string"}, "labels": {"type": "array", "items": {"type": "string"}},
                 "assignees": {"type": "array", "items": {"type": "string"}}, "draft": {"type": "boolean"},
                 "confirm": {"type": "boolean"},
+                "cwd": {"type": "string", "description": "Absolute HOST checkout/worktree path, not container /workspace."},
+                "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "message": {"type": "string"}, "staged": {"type": "boolean"},
             }, "additionalProperties": False,
                 "x-action-parameters": {k: {"allowed": sorted(v), "required": REQUIRED_BY_ACTION[k]}
                                         for k, v in BY_ACTION.items()}},
@@ -97,6 +115,29 @@ def validate(action: Any, repo: Any, params: Any) -> dict[str, Any]:
     if unknown:
         raise ValueError("unknown params: " + ", ".join(sorted(map(str, unknown))))
     p = dict(params)
+    if action in GIT_ACTIONS:
+        missing = set(REQUIRED_BY_ACTION[action]) - set(p)
+        if missing:
+            raise ValueError("missing params: " + ", ".join(sorted(missing)))
+        if not Path(_text(p["cwd"], "cwd", max_len=4096)).is_absolute():
+            raise ValueError("cwd must be an absolute host path")
+        if "staged" in p and type(p["staged"]) is not bool:
+            raise ValueError("staged must be boolean")
+        if "paths" in p:
+            if not isinstance(p["paths"], list) or not 1 <= len(p["paths"]) <= 100:
+                raise ValueError("paths must contain 1-100 relative paths")
+            for item in p["paths"]:
+                path = _text(item, "path", max_len=4096)
+                if Path(path).is_absolute() or ".." in Path(path).parts:
+                    raise ValueError("paths must be relative to cwd without '..'")
+        if "message" in p:
+            _text(p["message"], "message")
+        if "branch" in p:
+            branch = _text(p["branch"], "branch", max_len=255)
+            if (not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", branch)
+                    or any(part.startswith(".") or part.endswith(".lock") for part in branch.split("/"))
+                    or ".." in branch or "//" in branch or branch.endswith(("/", "."))):
+                raise ValueError("invalid branch")
     for key in ("number", "run_id"):
         if key in p and (not isinstance(p[key], (int, str)) or isinstance(p[key], bool) or not ID_RE.fullmatch(str(p[key]))):
             raise ValueError(f"{key} must be a positive numeric ID")
@@ -192,9 +233,18 @@ def _error(s: str) -> str:
     return _redact(s)[:2000]
 
 
-def _run(argv: list[str]) -> tuple[int, str, str]:
-    env = {"PATH": "/usr/bin:/bin", "HOME": "/home/shi", "GH_CONFIG_DIR": "/home/shi/.config/gh", "GH_PROMPT_DISABLED": "1", "GH_PAGER": "cat", "PAGER": "cat", "GIT_PAGER": "cat", "NO_COLOR": "1", "TERM": "dumb", "LANG": "C.UTF-8"}
-    proc = subprocess.Popen(argv, cwd=CWD, env=env, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def _home() -> Path:
+    """Active profile home, resolved per call instead of pinning an install path."""
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home())
+
+
+def _run(argv: list[str], *, cwd: str | None = None, timeout: float | None = None) -> tuple[int, str, str]:
+    home = Path.home()
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "GH_CONFIG_DIR": str(home / ".config/gh"), "GH_PROMPT_DISABLED": "1", "GH_PAGER": "cat", "PAGER": "cat", "GIT_PAGER": "cat", "NO_COLOR": "1", "TERM": "dumb", "LANG": "C.UTF-8"}
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
+    proc = subprocess.Popen(argv, cwd=cwd or str(_home()), env=env, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    deadline = time.monotonic() + (TIMEOUT if timeout is None else timeout)
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     overflow = threading.Event()
 
@@ -213,20 +263,84 @@ def _run(argv: list[str]) -> tuple[int, str, str]:
     for reader in readers: reader.start()
     timed_out = False
     try:
-        proc.wait(timeout=TIMEOUT)
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         timed_out = True
-        proc.terminate()
+        try: os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError: pass
         try:
             proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try: os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
             proc.wait()
-    for reader in readers: reader.join()
+    for reader in readers: reader.join(max(0, deadline - time.monotonic()))
+    if any(reader.is_alive() for reader in readers):
+        timed_out = True
+    if timed_out:
+        try: os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+    for reader in readers: reader.join(1)
     for pipe in (proc.stdout, proc.stderr): pipe.close()
     if timed_out: raise RuntimeError("gh timed out")
     if overflow.is_set(): raise RuntimeError("gh output exceeded limit")
     return proc.returncode, bytes(buffers["stdout"]).decode("utf-8", "replace"), bytes(buffers["stderr"]).decode("utf-8", "replace")
+
+
+def _git(action: str, repo: str, p: dict[str, Any]) -> dict[str, Any]:
+    """Normal host Git: checkout configuration and hooks are trusted, not sandboxed."""
+    cwd = str(Path(p["cwd"]).resolve(strict=True))
+    prefix = [GIT, "--no-pager", "--literal-pathspecs"]
+
+    def run(*args: str) -> str:
+        rc, out, err = _run(prefix + list(args), cwd=cwd, timeout=120)
+        if rc:
+            raise RuntimeError("git failed: " + (err.strip() or out.strip() or f"exit {rc}"))
+        return out.strip()
+
+    if run("rev-parse", "--is-inside-work-tree") != "true":
+        raise ValueError("cwd must be a Git checkout/worktree")
+    mutation = action in {"git_add", "git_commit", "git_fetch", "git_push"}
+    attempted = False
+    succeeded = False
+    try:
+        if action == "git_status":
+            return {"output": run("status", "--short", "--branch")}
+        if action == "git_diff":
+            return {"output": run("diff", "--no-ext-diff", "--no-textconv", *(["--cached"] if p.get("staged") else []), "--")}
+        if action == "git_log":
+            return {"output": run("log", "--oneline", "-n", str(p.get("limit", 20)))}
+        if action == "git_add":
+            attempted = True
+            output = run("add", "--", *p["paths"])
+            succeeded = True
+            return {"output": output, "status": run("status", "--short"), "write_succeeded": True, "verified": True, "retry_safe": False}
+        if action == "git_commit":
+            attempted = True
+            output = run("commit", "-m", p["message"])
+            succeeded = True
+            return {"output": output, "commit": run("rev-parse", "HEAD"), "write_succeeded": True, "verified": True, "retry_safe": False}
+        url = f"https://github.com/{repo}.git"
+        ref = "refs/heads/" + p["branch"]
+        if action == "git_fetch":
+            attempted = True
+            output = run("fetch", "--no-recurse-submodules", "--no-tags", url, ref)
+            succeeded = True
+            return {"output": output, "commit": run("rev-parse", "FETCH_HEAD"),
+                    "fetched_ref": ref, "write_succeeded": True, "verified": True, "retry_safe": False}
+        if action == "git_push":
+            commit = run("rev-parse", "--verify", ref + "^{commit}")
+            attempted = True
+            output = run("push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no", url, commit + ":" + ref)
+            succeeded = True
+            readback = run("ls-remote", "--refs", url, ref)
+            verified = readback.splitlines() == [commit + "\t" + ref]
+            return {"ok": verified, "output": output, "commit": commit, "remote_ref": ref,
+                    "readback": readback, "write_succeeded": True, "verified": verified, "retry_safe": False}
+        raise ValueError("unsupported Git action")
+    except Exception as exc:
+        return {"ok": False, "error": _error(str(exc)), "verified": False,
+                **({"write_succeeded": True if succeeded else None, "retry_safe": False} if mutation and attempted else {})}
 
 
 def _write_failure(message: str, write_succeeded: bool | None = None) -> str:
@@ -243,6 +357,11 @@ def handle(args: dict[str, Any], **kwargs: Any) -> str:
             raise ValueError("expected exactly action, repo, params")
         p = validate(args["action"], args["repo"], args["params"])
         action, repo = args["action"], args["repo"]
+        if action in GIT_ACTIONS:
+            result = _git(action, repo, p)
+            ok = result.get("ok", True)
+            _audit(action, repo, ok)
+            return _redact(json.dumps({"ok": ok, "result": result}, ensure_ascii=False))
         write = action in WRITE
         argv = _argv(action, repo, p)
         if write: attempted = True
@@ -292,4 +411,4 @@ def handle(args: dict[str, Any], **kwargs: Any) -> str:
 
 def register(ctx: Any) -> None:
     ctx.register_tool(name="host_github", toolset="host_github", schema=SCHEMA, handler=handle,
-                      description="Use the host GitHub CLI through a fixed, validated operation set.")
+                      description="Use host Git and GitHub Issue/PR operations with existing host identity and authentication.")

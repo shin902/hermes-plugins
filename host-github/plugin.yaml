@@ -4,6 +4,6 @@ kind: standalone
 version: 1.0.0
 author: Local
 homepage: https://github.com/NousResearch/hermes-agent
-description: Bounded host-side GitHub CLI operations using the installed gh authentication.
+description: Host Git and GitHub Issue/PR operations using existing host identity and authentication.
 provides_tools:
   - host_github
