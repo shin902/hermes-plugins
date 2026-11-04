@@ -17,6 +17,12 @@ assert spec is not None and spec.loader is not None
 acl = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = acl
 spec.loader.exec_module(acl)
+# Groups are live configuration (plugin-config/bot-acl/groups.yaml); tests use a
+# fixed fixture so they never depend on this machine's file.
+acl.DOMAINS = {
+    "main": {"default", "coding", "computer-use", "meta-bot"},
+    "local": {"local", "logbook", "screenpipe", "mail", "finance"},
+}
 
 
 class BotAclTests(unittest.TestCase):

@@ -1,5 +1,5 @@
 name: bot-acl
-version: "0.7.1"
+version: "0.8.0"
 description: Group ACL, roster filtering, synchronous consultations, and public-CLI bot tasks.
 provides_tools:
   - ask_bot

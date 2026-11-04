@@ -4,7 +4,19 @@ Local Bot Mode sending policy plus automatic-roster filtering, implemented with 
 
 ## Sending policy
 
-`pre_tool_call` rejects `message_agent` unless the sender and target belong to the same single group. Targets use canonical lowercase profile IDs (optionally prefixed with `@`); the reserved `hermes` handle identifies `default`. Arbitrary friendly-name aliases are rejected.
+`pre_tool_call` rejects `message_agent` unless the sender and target belong to the same single group.
+
+Groups are configuration, read once at plugin load from the default profile's
+`plugin-config/bot-acl/groups.yaml` (shared by every profile):
+
+```yaml
+main: [default, codex, claude]
+local: [local, mail]
+```
+
+A missing or malformed file yields no groups, so every message is denied. Reload the plugin after editing it.
+
+Targets use canonical lowercase profile IDs (optionally prefixed with `@`); the reserved `hermes` handle identifies `default`. Arbitrary friendly-name aliases are rejected.
 
 Missing/deleted local targets, self-targets, external-qualified targets, peer-name collisions, and unreadable/malformed configuration are denied. The existence check requires `profile.yaml` or `config.yaml` and checks `profiles/.deleted/<id>`; this conservative file-format dependency replaces private-function dependencies. Older config-only profiles remain supported.
 

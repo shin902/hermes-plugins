@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.0
+
+- Groups moved out of code into `plugin-config/bot-acl/groups.yaml` under the default HERMES_HOME. A missing or malformed file means no groups, so every message is denied.
+
 ## 0.7.1
 
 - Prefix a bot started session's title with `🤖` after the turn, so a consultation or task session is recognisable in the Desktop sidebar, the TUI and `sessions list`.

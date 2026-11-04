@@ -73,6 +73,24 @@ class CanonicalAclTests(unittest.TestCase):
         with patch.object(acl, "DOMAINS", {"one": {"default", "coding"}, "two": {"default", "coding"}}):
             self.blocked()
 
+    def test_groups_load_from_default_plugin_config(self):
+        from importlib import import_module
+        load_domains = import_module(acl.__name__ + ".policy").load_domains
+        self.assertEqual(load_domains(), {})  # missing -> no groups (fail closed)
+        groups = self.root / "plugin-config/bot-acl/groups.yaml"
+        groups.parent.mkdir(parents=True)
+        groups.write_text("main: [default, coding]\nlocal: [local]\n")
+        expected = {"main": {"default", "coding"}, "local": {"local"}}
+        self.assertEqual(load_domains(), expected)
+        # Profiles read the same file from the default HERMES_HOME.
+        profile = set_hermes_home_override(self.target)
+        self.addCleanup(reset_hermes_home_override, profile)
+        self.assertEqual(load_domains(), expected)
+        for bad in ("[\n", "- a\n", "main: default\n", "main: [1]\n"):
+            with self.subTest(bad=bad):
+                groups.write_text(bad)
+                self.assertEqual(load_domains(), {})
+
     def test_no_private_core_imports(self):
         tree = ast.parse(Path(__file__).with_name("policy.py").read_text())
         imports = [(node.module, item.name) for node in ast.walk(tree)

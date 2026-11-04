@@ -1,6 +1,6 @@
 """Profile-domain ACL for Hermes Bot Mode."""
 
-from .policy import check
+from .policy import check, load_domains
 from .roster import filter_roster
 from .ask_bot import register as register_ask_bot
 from .ask_bot import register_prompt as register_consult_prompt
@@ -8,10 +8,7 @@ from .list_bot_peers import register as register_list_bot_peers
 from .bot_task import register as register_bot_task
 from .bot_task import register_prompt as register_task_prompt
 
-DOMAINS = {
-    "main": {"default", "coding", "computer-use", "meta-bot"},
-    "local": {"local", "logbook", "screenpipe", "mail", "finance"},
-}
+DOMAINS = load_domains()
 
 
 def check_bot_acl(tool_name, args, **kwargs):

@@ -15,6 +15,28 @@ def _read_mapping(path):
     return data
 
 
+def _source_and_root():
+    """(current profile id, default HERMES_HOME) from public home resolution."""
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    return (home.name, home.parent.parent) if home.parent.name == "profiles" else ("default", home)
+
+
+def load_domains():
+    """Groups are configuration, not code: <default HERMES_HOME>/plugin-config/bot-acl/groups.yaml
+    maps group name -> list of canonical profile IDs. Missing or malformed -> no groups,
+    so every message is denied (fail closed)."""
+    try:
+        _, root = _source_and_root()
+        data = _read_mapping(root / "plugin-config" / "bot-acl" / "groups.yaml")
+        if not all(isinstance(m, list) and all(isinstance(x, str) for x in m) for m in data.values()):
+            raise ValueError("each group must be a list of profile IDs")
+        return {str(name): set(members) for name, members in data.items()}
+    except Exception:
+        return {}
+
+
 def _local_profile_exists(root, name):
     # Both profile.yaml and config.yaml identify real profiles. Older profiles
     # may have configuration but no metadata file.
@@ -31,13 +53,7 @@ def check(domains, tool_name, args, **kwargs):
     source = target = None
     reason = "could not verify local profile domain membership"
     try:
-        from hermes_constants import get_hermes_home
-
-        home = Path(get_hermes_home())
-        if home.parent.name == "profiles":
-            source, root = home.name, home.parent.parent
-        else:
-            source, root = "default", home
+        source, root = _source_and_root()
         raw = (args or {}).get("target")
         if not isinstance(raw, str):
             raise ValueError("target must be a string")
