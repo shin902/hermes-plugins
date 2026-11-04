@@ -23,4 +23,6 @@ hermes plugins doctor <plugin-dir> --ci
 ```
 
 No `private core imports` (new or increased) and no `no core override` findings.
-Run the relevant tests from `SETUP.md`.
+Run the plugin's own tests (`test_*.py` beside it or under `tests/`).
+Which profile installs or enables a plugin is configuration: keep it in the
+private `hermes-config` repository, never in this public repository.

@@ -1,10 +1,6 @@
 *
 !*/
 !.gitignore
-!setup_profiles.py
-!test_setup_profiles.py
-!profile-plugins.json
-!SETUP.md
 !README.md
 !**/*.py
 !**/*.ts

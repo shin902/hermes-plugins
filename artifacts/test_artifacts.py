@@ -1,4 +1,4 @@
-"""Stdlib-only publisher and shared-deployment regression check."""
+"""Stdlib-only publisher regression check."""
 import importlib.util
 import json
 from pathlib import Path
@@ -11,10 +11,6 @@ spec.loader.exec_module(plugin)
 
 
 def check():
-    mapping = json.loads(Path(__file__).parents[1].joinpath('profile-plugins.json').read_text())
-    entries = [e for e in mapping['mappings'] if e['plugin'] == 'artifacts']
-    assert {e['profile'] for e in entries} == {'default', 'coding'}
-    assert all(e['source'] == 'artifacts' and e['version'] == '1.0.0' for e in entries)
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         plugin.ROOT = base / 'published'
@@ -34,7 +30,7 @@ def check():
         (source / 'link').symlink_to(source / 'note.md')
         assert not json.loads(plugin.publish({'source': str(source), 'slug': 'bad-link', 'title': 'bad'}))['ok']
         assert not list(plugin.ROOT.glob('.publish-*'))
-    print('PASS: shared profile mappings, HTML/Markdown publishing, metadata, duplicates, invalid slugs and symlinks')
+    print('PASS: HTML/Markdown publishing, metadata, duplicates, invalid slugs and symlinks')
 
 
 if __name__ == '__main__':

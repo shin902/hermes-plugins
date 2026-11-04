@@ -5,9 +5,7 @@ assets into `~/.hermes/sites/homepage/artifacts/<slug>/`. The personal homepage
 reads `artifact.json` in each folder to generate its `/artifacts/index.html`
 cards. The homepage server is an existing deployment, not started by this plugin.
 
-The default and coding profiles link to this single plugin source through
-`profile-plugins.json`; published files remain outside Git and outside both
-profile plugin directories. Returned URLs are site-relative so no personal
+Published files remain outside Git and outside every profile's plugin directory. Returned URLs are site-relative so no personal
 Tailnet hostname is committed to this public repository.
 
 Parameters: `source` (absolute folder), `slug` (unique lowercase letters, digits,
