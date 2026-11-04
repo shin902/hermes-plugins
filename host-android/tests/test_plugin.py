@@ -2,10 +2,20 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+# The plugin resolves the profile home through the Hermes runtime; stand it in for tests.
+_PROFILE_HOME = Path(tempfile.mkdtemp(prefix="host-android-home-"))
+sys.modules.setdefault("hermes_constants", types.SimpleNamespace(
+    get_hermes_home=lambda: str(_PROFILE_HOME),
+    get_default_hermes_root=lambda: str(_PROFILE_HOME.parent),
+    profile_name_for_home=lambda _: "default",
+))
 
 PLUGIN = Path(__file__).resolve().parents[1] / "host_android.py"
 spec = importlib.util.spec_from_file_location("host_android_plugin", PLUGIN)
@@ -44,19 +54,20 @@ class ValidationTests(unittest.TestCase):
             plugin._action_key({"device":"emulator-5554","key":"back","confirm":True})
             self.assertEqual(adb.call_args.args[1], ["shell","input","keyevent","KEYCODE_BACK"])
         for text in ("-x", "hello;id", "hello$HOME", "'quoted'", "hello\nworld", "日本語", "a"*257):
-            with self.assertRaises(plugin.AndroidError): plugin._action_type({"device":"emulator-5554","text":text,"workdir":"coding"})
+            with self.assertRaises(plugin.AndroidError): plugin._action_type({"device":"emulator-5554","text":text,"workdir":"profile"})
 
     def test_orca_context_is_explicit_and_allowlisted(self):
         with self.assertRaises(plugin.AndroidError): plugin._workdir("/tmp")
         with self.assertRaises(plugin.AndroidError): plugin._workdir("../coding")
         with patch.object(plugin,"_orca",return_value={"ok":True}) as call:
-            plugin._action_ax({"device":"emulator-5554","workdir":"coding"})
+            plugin._action_ax({"device":"emulator-5554","workdir":"profile"})
             self.assertIn("--worktree",call.call_args.args[2])
 
     def test_absolute_worktree_is_validated_and_avd_attach_selector_is_narrow(self):
         with tempfile.TemporaryDirectory() as td:
             candidate=Path(td)/"repo"; candidate.mkdir()
-            with patch.dict(plugin.REPOS,{"myjune-worktrees":Path(td)}):
+            repos={"myjune":Path(td)/"none", "myjune-worktrees":Path(td), "profile":_PROFILE_HOME}
+            with patch.object(plugin,"_repos",return_value=repos):
                 self.assertEqual(plugin._workdir(str(candidate)),candidate)
                 with self.assertRaises(plugin.AndroidError): plugin._workdir("/tmp")
         self.assertEqual(plugin._attach_device("MyJune_API_36"),"MyJune_API_36")
@@ -108,11 +119,12 @@ class RecordingTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name)
-        self.old_evidence=plugin.EVIDENCE; plugin.EVIDENCE=self.root/"evidence"
-        self.addCleanup(setattr,plugin,"EVIDENCE",self.old_evidence)
+        self.evidence=self.root/"evidence"
+        patcher=patch.object(plugin,"_evidence",return_value=self.evidence)
+        patcher.start(); self.addCleanup(patcher.stop)
 
     def write_job(self, **changes):
-        job={"id":"12345678-1234-4234-8234-123456789abc","device":"emulator-5554","duration":3,"status":"complete","created":1,"output":str(plugin.EVIDENCE/"12345678-1234-4234-8234-123456789abc"/"recording.mp4"),"remote":"/sdcard/host_android_12345678-1234-4234-8234-123456789abc.mp4","pid":99999999,"proc_start":"1"}
+        job={"id":"12345678-1234-4234-8234-123456789abc","device":"emulator-5554","duration":3,"status":"complete","created":1,"output":str(self.evidence/"12345678-1234-4234-8234-123456789abc"/"recording.mp4"),"remote":"/sdcard/host_android_12345678-1234-4234-8234-123456789abc.mp4","pid":99999999,"proc_start":"1"}
         job.update(changes); plugin._atomic_json(plugin._job_path(job["id"]),job); return job
 
     def test_status_and_stale_worker_detection(self):
@@ -145,7 +157,7 @@ class RecordingTests(unittest.TestCase):
         path.rename(real); path.symlink_to(real)
         with self.assertRaises(plugin.AndroidError): plugin._read_job(job["id"])
         path.unlink(); real.unlink()
-        jobs=plugin.EVIDENCE/".host-android-jobs"; jobs.rmdir(); jobs.symlink_to(self.root,target_is_directory=True)
+        jobs=self.evidence/".host-android-jobs"; jobs.rmdir(); jobs.symlink_to(self.root,target_is_directory=True)
         with self.assertRaises(plugin.AndroidError): plugin._jobs_dir()
 
     def test_collect_failure_never_leaves_final_media(self):
@@ -200,7 +212,7 @@ class RecordingTests(unittest.TestCase):
 import sys
 p=importlib.util.spec_from_file_location("worker_plugin",{module!r}); m=importlib.util.module_from_spec(p); p.loader.exec_module(m)
 from pathlib import Path
-m.EVIDENCE=Path({str(self.root / "evidence")!r})
+m._evidence=lambda: Path({str(self.root / "evidence")!r})
 m._run=lambda *a,**k:(0,"","")
 raise SystemExit(m._record_worker(sys.argv[1]))'''
         spawned=[]; real_popen=subprocess.Popen
@@ -220,7 +232,7 @@ raise SystemExit(m._record_worker(sys.argv[1]))'''
         collect_code=f'''import importlib.util,os
 p=importlib.util.spec_from_file_location("collect_plugin",{module!r}); m=importlib.util.module_from_spec(p); p.loader.exec_module(m)
 from pathlib import Path
-m.EVIDENCE=Path({str(self.root / "evidence")!r})
+m._evidence=lambda: Path({str(self.root / "evidence")!r})
 def run(argv,**kwargs): Path(argv[-1]).write_bytes(b"verified fixture"); return (0,"ok","")
 m._run=run; m._valid_recording=lambda path:(3.0,"h264")
 m._action_record_collect({{"job_id":{job_id!r}}})'''

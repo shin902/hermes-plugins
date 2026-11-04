@@ -79,14 +79,18 @@ def _resolve_args() -> list[str]:
 
 def _resolve_cwd(cwd: str | None = None) -> str:
     """Keep visible workspaces; never start ACP inside masked Hermes state."""
-    masked = Path('/home/shi/.hermes').resolve()
+    try:
+        from hermes_constants import get_default_hermes_root
+        masked = Path(get_default_hermes_root()).resolve()
+    except ImportError:
+        masked = (Path.home() / '.hermes').resolve()
     try:
         candidate = Path(cwd or os.getcwd()).resolve(strict=True)
         if candidate.is_dir() and not candidate.is_relative_to(masked):
             return str(candidate)
     except OSError:
         pass  # Includes a caller whose working directory has been deleted.
-    fallback = Path('/home/shi/acp-workspaces/opencode-readonly-default')
+    fallback = Path.home() / 'acp-workspaces/opencode-readonly-default'
     # Create only these two dedicated directories, as the invoking user.
     fallback.parent.mkdir(mode=0o700, exist_ok=True)
     fallback.mkdir(mode=0o700, exist_ok=True)

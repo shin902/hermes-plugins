@@ -2,19 +2,40 @@
 import json
 import os
 from pathlib import Path
+import pwd
+import shutil
 import subprocess
 
-HOME = Path('/home/shi/.hermes/profiles/coding')
-ROOT = HOME.parent.parent
-HERMES = '/home/shi/.hermes/hermes-agent/.hermes/bin/hermes'
+
+def _home() -> Path:
+    """Active profile home; resolved per call so no installation path is baked in."""
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home())
+
+
+def _root() -> Path:
+    """Hermes installation root (the HERMES_HOME that holds default and named profiles)."""
+    from hermes_constants import get_default_hermes_root
+    return Path(get_default_hermes_root())
+
+
+def _binary() -> str:
+    """Locate the installed Hermes executable without pinning one install layout."""
+    for candidate in (Path.home() / '.hermes/hermes-agent/.hermes/bin/hermes',
+                      shutil.which('hermes'), '/usr/local/bin/hermes'):
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    raise RuntimeError('hermes executable not found; install it or put it on PATH')
 
 
 def environment():
     # No inherited credentials, Python injection, PATH overrides, or launch-profile data.
-    return {'HOME': '/home/shi', 'USER': 'shi', 'LOGNAME': 'shi',
+    uid = os.getuid()
+    user = pwd.getpwuid(uid).pw_name
+    return {'HOME': str(Path.home()), 'USER': user, 'LOGNAME': user,
             'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
-            'HERMES_HOME': str(ROOT), 'XDG_RUNTIME_DIR': '/run/user/' + str(os.getuid()),
-            'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/' + str(os.getuid()) + '/bus'}
+            'HERMES_HOME': str(_root()), 'XDG_RUNTIME_DIR': f'/run/user/{uid}',
+            'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{uid}/bus'}
 
 
 def validate(args):
@@ -154,12 +175,9 @@ def guard_conversation(argv):
 
 
 def execute(args):
-    from hermes_constants import get_hermes_home
-    if Path(get_hermes_home()).resolve() != HOME:
-        raise PermissionError('Only the coding profile may use this tool')
     argv = validate(args)
     try:
-        result = subprocess.run([HERMES, *argv], env=environment(), cwd=HOME,
+        result = subprocess.run([_binary(), *argv], env=environment(), cwd=str(_home()),
                                 stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, errors='replace', timeout=600, shell=False)
         return {'stdout': result.stdout, 'stderr': result.stderr,
@@ -177,9 +195,13 @@ def administer(args, **kwargs):
         return json.dumps({'ok': True, **execute(args)})
     except (ValueError, TypeError, KeyError, PermissionError, OSError, RuntimeError,
             subprocess.TimeoutExpired) as exc:
-        # Do not expose raw CLI stdout/stderr or input values.
+        # Do not expose raw CLI stdout/stderr or input values. Guard denials are
+        # our own fixed strings, and PermissionError is an OSError subclass, so
+        # it must be matched first or a denial reads as a broken host operation.
         if isinstance(exc, subprocess.TimeoutExpired):
             message = 'Command timed out; mutation outcome unknown, read status before retrying'
+        elif isinstance(exc, PermissionError):
+            message = str(exc)
         elif isinstance(exc, (OSError, TypeError, KeyError)):
             message = 'Host operation or input failed; details withheld'
         else:

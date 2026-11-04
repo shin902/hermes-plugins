@@ -43,7 +43,9 @@ ALLOWED = [['--version'], ['--help'], ['--tui', '--version'],
  ['--print-runtime-command']]
 class GuardTests(unittest.TestCase):
  def caller(self):
-  return patch.dict(sys.modules, {'hermes_constants': types.SimpleNamespace(get_hermes_home=lambda: str(m.HOME))})
+  return patch.dict(sys.modules, {'hermes_constants': types.SimpleNamespace(
+      get_hermes_home=lambda: '/tmp/profile-home',
+      get_default_hermes_root=lambda: '/tmp/hermes-root')})
  def test_blocked_before_subprocess(self):
   for argv in BLOCKED:
    for prefix in (([],) if argv[:1] == ['--run-module'] else ([], ['-p', 'default'], ['--profile=other'])):
@@ -53,12 +55,21 @@ class GuardTests(unittest.TestCase):
      run.assert_not_called()
  def test_passthrough_and_boundary(self):
   for argv in ALLOWED:
-   with self.subTest(argv=argv), self.caller(), patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'output', '')) as run:
+   with self.subTest(argv=argv), self.caller(), patch.object(m, '_binary', return_value='/fake/hermes'), patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'output', '')) as run:
     self.assertTrue(json.loads(m.administer({'argv': argv}))['ok'])
-    self.assertEqual(run.call_args.args[0], [m.HERMES, *argv])
+    self.assertEqual(run.call_args.args[0], ['/fake/hermes', *argv])
+    self.assertEqual(run.call_args.kwargs['cwd'], '/tmp/profile-home')
     self.assertIs(run.call_args.kwargs['shell'], False)
     self.assertEqual(run.call_args.kwargs['stdin'], subprocess.DEVNULL)
     self.assertEqual(run.call_args.kwargs['timeout'], 600)
+ def test_denial_reason_is_reported(self):
+  # PermissionError subclasses OSError, so it must be matched first; otherwise a
+  # policy denial is indistinguishable from a broken host operation.
+  with self.caller(), patch.object(m.subprocess, 'run') as run:
+   result = json.loads(m.administer({'argv': ['chat']}))
+  self.assertFalse(result['ok'])
+  self.assertEqual(result['error'], 'Direct conversation/agent-launch route is not permitted by hermes_cli')
+  run.assert_not_called()
  def test_invalid(self):
   for args in (None, {}, {'argv': 'chat'}, {'argv': [1]}, {'argv': ['\x00']}, {'argv': [], 'extra': 1}):
    with self.caller(), patch.object(m.subprocess, 'run') as run:
@@ -74,21 +85,25 @@ class GuardTests(unittest.TestCase):
   self.assertIn('cross-profile', schema['description'])
   print('FRESH_REGISTRATION_SCHEMA', json.dumps(schema))
  def test_output_contract(self):
-  with self.caller(), patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 7, 'out', 'err')):
+  with self.caller(), patch.object(m, '_binary', return_value='/fake/hermes'), patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 7, 'out', 'err')):
    r=json.loads(m.administer({'argv':['future-admin']}))
    self.assertEqual((r['ok'],r['exit_code'],r['stdout'],r['stderr'],r['timed_out']), (True,7,'out','err',False))
-  with self.caller(), patch.object(m.subprocess, 'run', side_effect=subprocess.TimeoutExpired('fixed',600,output=b'partial',stderr=b'error')):
+  with self.caller(), patch.object(m, '_binary', return_value='/fake/hermes'), patch.object(m.subprocess, 'run', side_effect=subprocess.TimeoutExpired('fixed',600,output=b'partial',stderr=b'error')):
    r=json.loads(m.administer({'argv':['future-admin']}))
    self.assertTrue(r['timed_out']); self.assertIsNone(r['exit_code'])
    self.assertEqual((r['stdout'],r['stderr']),('partial','error'))
- def test_wrong_caller(self):
-  with patch.dict(sys.modules, {'hermes_constants':types.SimpleNamespace(get_hermes_home=lambda:'/different')}), patch.object(m.subprocess,'run') as run:
-   self.assertFalse(json.loads(m.administer({'argv':['--version']}))['ok'])
-   run.assert_not_called()
+ def test_any_profile_home_is_accepted(self):
+  for home in ('/tmp/one-profile', '/tmp/another-profile'):
+   with patch.dict(sys.modules, {'hermes_constants': types.SimpleNamespace(
+            get_hermes_home=lambda home=home: home,
+            get_default_hermes_root=lambda: '/tmp/hermes-root')}), patch.object(m, '_binary', return_value='/fake/hermes'), patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+    self.assertTrue(json.loads(m.administer({'argv': ['--version']}))['ok'])
+    self.assertEqual(run.call_args.kwargs['cwd'], home)
  def test_environment(self):
-  with patch.dict('os.environ', {'API_KEY': 'private', 'PYTHONPATH': '/bad'}):
+  with self.caller(), patch.dict('os.environ', {'API_KEY': 'private', 'PYTHONPATH': '/bad'}):
    env = m.environment()
   self.assertNotIn('API_KEY', env)
   self.assertNotIn('PYTHONPATH', env)
+  self.assertEqual(env['HERMES_HOME'], '/tmp/hermes-root')
 if __name__ == '__main__':
  unittest.main(verbosity=2)

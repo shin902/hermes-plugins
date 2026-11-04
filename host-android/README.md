@@ -31,11 +31,12 @@ for user authorization in an agent workflow.
 | `record_collect` | `job_id` | none | Only after clean worker completion, pulls and validates MP4, then returns the absolute path. |
 
 Device actions other than attach require `emulator-[0-9]+`. Orca actions require
-an explicit `workdir`: aliases `myjune`, `myjune-worktrees`, or `coding`, or a
-validated absolute directory under `/home/shi/orca/workspaces/MyJune`, the
-MyJune repository, or the coding profile. Symlinks and resolved escapes are
+an explicit `workdir`: aliases `myjune`, `myjune-worktrees`, or `profile`, or a
+validated absolute directory under the MyJune worktrees, the MyJune repository,
+or the calling profile's Hermes home. Symlinks and resolved escapes are
 rejected. The resolved directory is passed to Orca as an explicit worktree path.
-Android SDK, Java, AVD, Orca, ffmpeg, and ffprobe paths are fixed in code.
+Android SDK, Java, AVD, Orca, ffmpeg, and ffprobe paths are resolved from the
+user home at call time.
 
 ## Recording lifecycle
 
@@ -70,7 +71,7 @@ actions unless the user has authorized that operation.
 ## Activation (not executed)
 
 The plugin is not enabled by this artifact. To activate later, add
-`host-android` to `plugins.enabled` in the coding profile's Hermes config and
+`host-android` to `plugins.enabled` in the target profile's Hermes config and
 restart/reload Hermes. This task did not change configuration.
 
 ## Verification scope
@@ -81,7 +82,7 @@ Run tests with:
 python -m unittest discover -s plugins/host-android/tests -v
 ```
 
-Plugin doctor may be run with `hermes --profile coding plugins doctor
+Plugin doctor may be run with `hermes plugins doctor
 plugins/host-android --ci`. A real device MP4 end-to-end check is intentionally
 not claimed: the emulator was shut down during verification. Tests generate a
 synthetic color clip with the configured ffmpeg binary and run the actual

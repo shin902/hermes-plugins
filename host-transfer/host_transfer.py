@@ -16,11 +16,12 @@ SSH = "/usr/bin/ssh"
 SCP = "/usr/bin/scp"
 SHA256SUM = "/usr/bin/sha256sum"
 NULL_CONFIG = "/dev/null"
-IDENTITY = "/home/shi/.ssh/id_ed25519_mac"
-KNOWN_HOSTS = "/home/shi/.ssh/known_hosts"
-LOCAL_ROOT = Path("/home/shi")
-SSH_DIR = Path("/home/shi/.ssh")
-CWD = "/home/shi"
+HOME = Path.home()
+IDENTITY = str(HOME / ".ssh/id_ed25519_mac")
+KNOWN_HOSTS = str(HOME / ".ssh/known_hosts")
+LOCAL_ROOT = HOME
+SSH_DIR = HOME / ".ssh"
+CWD = str(HOME)
 TIMEOUT = 180
 MAX_OUTPUT = 200_000
 
@@ -41,7 +42,7 @@ SCHEMA = {
             "params": {"type": "object", "description": "Action parameters; see x-action-parameters.", "properties": {
                 "target": {"type": "string", "enum": sorted(TARGETS), "default": "mac",
                            "description": "Named remote destination; currently only the Mac."},
-                "local_path": {"type": "string", "description": "Absolute host path under /home/shi to a regular file."},
+                "local_path": {"type": "string", "description": "Absolute host path under the user home directory to a regular file."},
                 "confirm": {"type": "boolean"},
             }, "additionalProperties": False,
                 "x-action-parameters": {k: {"allowed": sorted(ALLOWED[k]), "required": REQUIRED[k]} for k in ACTIONS}},
@@ -61,7 +62,7 @@ def _local_file(value: Any) -> str:
     except (OSError, RuntimeError):
         raise ValueError("local_path does not exist")
     if not real.is_relative_to(LOCAL_ROOT):
-        raise ValueError("local_path must be under /home/shi")
+        raise ValueError("local_path must be under the home directory")
     if real == SSH_DIR or SSH_DIR in real.parents:
         raise ValueError("local_path must not reference SSH material")
     if not real.is_file():
@@ -121,7 +122,7 @@ def _remote_sha_argv(target: str, remote_path: str) -> list[str]:
 
 
 def _run(argv: list[str], timeout: float = TIMEOUT) -> tuple[int, str, str]:
-    env = {"PATH": "/usr/bin:/bin", "HOME": "/home/shi", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "dumb"}
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(HOME), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "TERM": "dumb"}
     proc = subprocess.Popen(argv, cwd=CWD, env=env, shell=False, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
     buffers = {"stdout": bytearray(), "stderr": bytearray()}

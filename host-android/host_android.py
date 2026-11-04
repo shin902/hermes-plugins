@@ -21,23 +21,37 @@ from pathlib import Path
 from typing import Any
 
 ID = "host-android"
-ORCA = Path("/home/shi/.local/bin/orca")
-ADB = Path("/home/shi/Android/Sdk/platform-tools/adb")
-EMULATOR = Path("/home/shi/Android/Sdk/emulator/emulator")
-FFMPEG_DIR = Path("/home/shi/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin")
+HOME = Path.home()
+ORCA = HOME / ".local/bin/orca"
+ANDROID_SDK = HOME / "Android/Sdk"
+ADB = ANDROID_SDK / "platform-tools/adb"
+EMULATOR = ANDROID_SDK / "emulator/emulator"
+FFMPEG_DIR = HOME / ".hermes/tools/ffmpeg-9.0.1-linux-x64/bin"
 FFMPEG = FFMPEG_DIR / "ffmpeg"
 FFPROBE = FFMPEG_DIR / "ffprobe"
-ANDROID_SDK = Path("/home/shi/Android/Sdk")
-AVD_HOME = Path("/home/shi/.config/.android/avd")
-JAVA_HOME = Path("/home/shi/.local/share/android-java")
-HOME = Path("/home/shi")
-PROFILE = Path("/home/shi/.hermes/profiles/coding")
-EVIDENCE = PROFILE / "workspace/android-evidence"
-REPOS = {
-    "myjune": Path("/home/shi/ghq/github.com/samezima10101/MyJune"),
-    "myjune-worktrees": Path("/home/shi/orca/workspaces/MyJune"),
-    "coding": Path("/home/shi/.hermes/profiles/coding"),
-}
+AVD_HOME = HOME / ".config/.android/avd"
+JAVA_HOME = HOME / ".local/share/android-java"
+
+
+def _profile_home() -> Path:
+    """Active profile home, resolved per call instead of pinning a profile name."""
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home())
+
+
+def _evidence() -> Path:
+    return _profile_home() / "workspace/android-evidence"
+
+
+def _repos() -> dict[str, Path]:
+    """Allowlisted working directories; the profile entry always follows the active profile."""
+    return {
+        "myjune": HOME / "ghq/github.com/samezima10101/MyJune",
+        "myjune-worktrees": HOME / "orca/workspaces/MyJune",
+        "profile": _profile_home(),
+    }
+
+
 PACKAGES = {"com.shi0203.MyJune"}
 AVDS = {"MyJune_API_36"}
 DEVICE_RE = re.compile(r"emulator-[0-9]+\Z")
@@ -96,13 +110,14 @@ def _reject_symlink_components(path: Path) -> None:
 def _workdir(value: Any) -> Path:
     if not isinstance(value, str):
         raise AndroidError("workdir must be an allowlisted alias or absolute directory")
-    if value in REPOS:
-        base = REPOS[value]
+    repos = _repos()
+    if value in repos:
+        base = repos[value]
     else:
         base = Path(value)
-        roots = (REPOS["myjune-worktrees"], REPOS["myjune"], REPOS["coding"])
+        roots = tuple(repos.values())
         if not base.is_absolute() or not any(base == root or root in base.parents for root in roots):
-            raise AndroidError("workdir is outside the MyJune and coding directories")
+            raise AndroidError("workdir is outside the allowed directories")
     try:
         _reject_symlink_components(base)
         resolved = base.resolve(strict=True)
@@ -178,7 +193,7 @@ def _redact(text: str) -> str:
 def _run(argv: list[str], *, env: dict[str, str], cwd: Path | None = None, timeout: int = TIMEOUT,
          binary: bool = False, max_bytes: int = MAX_OUTPUT) -> tuple[int, bytes | str, str]:
     """Bound output during reads, drain both pipes, and terminate a timed-out group."""
-    p = subprocess.Popen(argv, cwd=str(cwd) if cwd else str(PROFILE), env=env,
+    p = subprocess.Popen(argv, cwd=str(cwd) if cwd else str(_profile_home()), env=env,
                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          start_new_session=True)
     out = bytearray(); err = bytearray(); overflow = False
@@ -259,13 +274,10 @@ def _atomic_json(path: Path, value: dict) -> None:
 
 
 def _jobs_dir() -> Path:
-    base = PROFILE if EVIDENCE == PROFILE or PROFILE in EVIDENCE.parents else EVIDENCE.parent
-    cursor = base
-    for part in EVIDENCE.relative_to(base).parts:
-        cursor = cursor / part
-        if cursor.is_symlink(): raise AndroidError("evidence directories may not contain symlinks")
-    EVIDENCE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = EVIDENCE / ".host-android-jobs"
+    evidence = _evidence()
+    if evidence.is_symlink(): raise AndroidError("evidence directories may not contain symlinks")
+    evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = evidence / ".host-android-jobs"
     if path.is_symlink(): raise AndroidError("evidence job directory may not be a symlink")
     path.mkdir(parents=True, exist_ok=True, mode=0o700); os.chmod(path, 0o700)
     return path
@@ -287,7 +299,7 @@ def _read_job(job_id: str) -> dict:
     if not isinstance(data,dict) or set(data)-fields: raise AndroidError("recording state fields are invalid")
     if data.get("id") != job_id or not isinstance(data.get("device"),str) or not DEVICE_RE.fullmatch(data["device"]): raise AndroidError("recording state failed validation")
     if type(data.get("duration")) is not int or not 1<=data["duration"]<=180 or data.get("status") not in {"starting","running","complete","failed","collected"}: raise AndroidError("recording state invariants failed")
-    if data.get("output") != str(EVIDENCE/job_id/"recording.mp4") or data.get("remote") != f"/sdcard/host_android_{job_id}.mp4": raise AndroidError("recording state paths failed validation")
+    if data.get("output") != str(_evidence()/job_id/"recording.mp4") or data.get("remote") != f"/sdcard/host_android_{job_id}.mp4": raise AndroidError("recording state paths failed validation")
     if type(data.get("created")) is not int: raise AndroidError("recording state timestamp is invalid")
     if "pid" in data and (type(data["pid"]) is not int or data["pid"]<=1): raise AndroidError("recording worker pid is invalid")
     if "proc_start" in data and not isinstance(data["proc_start"],str): raise AndroidError("recording worker identity is invalid")
@@ -336,7 +348,7 @@ def _action_devices(_: dict) -> dict:
             if fields and DEVICE_RE.fullmatch(fields[0]): rows.append({"serial": fields[0], "state": fields[1] if len(fields)>1 else "unknown"})
     except AndroidError as exc: adb_error = str(exc)
     orca_data = None; orca_error = None
-    try: orca_data = _orca("devices", _workdir("coding"), ["emulator", "devices"])
+    try: orca_data = _orca("devices", _workdir("profile"), ["emulator", "devices"])
     except AndroidError as exc: orca_error = str(exc)
     return {"adb": rows, "adb_error": adb_error, "orca": orca_data, "orca_error": orca_error,"ok":adb_error is None or orca_error is None}
 
@@ -365,7 +377,7 @@ def _action_ax(p: dict) -> Any:
 def _action_screenshot(p: dict) -> dict:
     device = _device(p["device"])
     _jobs_dir()
-    root = EVIDENCE.resolve(strict=True)
+    root = _evidence().resolve(strict=True)
     target = root / f"screenshot-{uuid.uuid4()}.png"
     if target.exists() or target.is_symlink(): raise AndroidError("evidence target already exists")
     data = _adb(device, ["exec-out", "screencap", "-p"], timeout=15, binary=True, max_bytes=MAX_BINARY)
@@ -425,7 +437,7 @@ def _action_force_stop(p: dict) -> dict:
 
 def _action_install(p: dict) -> dict:
     device=_device(p["device"])
-    apk=_safe_path(p["apk_path"], suffix=".apk", roots=(REPOS["myjune"], REPOS["myjune-worktrees"]))
+    apk=_safe_path(p["apk_path"], suffix=".apk", roots=(_repos()["myjune"], _repos()["myjune-worktrees"]))
     if p["confirm"] is not True: raise AndroidError("install changes device state; confirm=true is required")
     out=_adb(device,["install","-r",str(apk)],timeout=120,max_bytes=20000)
     return {"installed": str(apk), "output": out}
@@ -452,7 +464,7 @@ def _action_record_start(p: dict) -> dict:
     if p["confirm"] is not True: raise AndroidError("screen recording requires confirm=true")
     jobs=_jobs_dir()
     lock=jobs/f"device-{device}.lock"
-    job_id=str(uuid.uuid4()); output_dir=EVIDENCE/job_id
+    job_id=str(uuid.uuid4()); output_dir=_evidence()/job_id
     output_dir.mkdir(parents=True,mode=0o700); os.chmod(output_dir,0o700)
     state={"id":job_id,"device":device,"duration":duration,"status":"starting","created":int(time.time()),"output":str(output_dir/"recording.mp4"),"remote":f"/sdcard/host_android_{job_id}.mp4"}
     state_path=_job_path(job_id); _atomic_json(state_path,state)
@@ -486,7 +498,7 @@ def _action_record_start(p: dict) -> dict:
         os.close(lockfd)
     argv=_worker_command(job_id)
     try:
-        proc=subprocess.Popen(argv,cwd=str(PROFILE),env=_clean_env(),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True)
+        proc=subprocess.Popen(argv,cwd=str(_profile_home()),env=_clean_env(),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True)
     except OSError as exc:
         state["status"]="failed"; state["error"]="recording worker could not start"
         _atomic_json(state_path,state); _release_device_lock(state)
@@ -535,7 +547,7 @@ def _action_record_collect(p: dict) -> dict:
     if job.get("status") not in {"complete","collected"}: raise AndroidError("recording is not complete; collection is unavailable")
     _device(job["device"])
     if job.get("remote") != f"/sdcard/host_android_{job['id']}.mp4": raise AndroidError("recording remote path failed ownership validation")
-    target=Path(job["output"]); expected=EVIDENCE/job["id"] / "recording.mp4"
+    target=Path(job["output"]); expected=_evidence()/job["id"] / "recording.mp4"
     _reject_symlink_components(target.parent)
     if target != expected or target.is_symlink(): raise AndroidError("recording output path failed ownership validation")
     if job.get("status")=="collected":
@@ -581,7 +593,7 @@ def _record_worker(job_id: str) -> int:
     else: return 2
     if not _device(job.get("device")) or type(job.get("duration")) is not int or not 1<=job["duration"]<=180:
         return 2
-    if job.get("remote") != f"/sdcard/host_android_{job_id}.mp4" or job.get("output") != str(EVIDENCE/job_id/"recording.mp4"):
+    if job.get("remote") != f"/sdcard/host_android_{job_id}.mp4" or job.get("output") != str(_evidence()/job_id/"recording.mp4"):
         return 2
     argv=[str(ADB),"-s",job["device"],"shell","screenrecord","--time-limit",str(job["duration"]),job["remote"]]
     try:

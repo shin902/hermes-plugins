@@ -57,7 +57,7 @@ HISTORICAL ARCHIVE BELOW — superseded, not the current policy.
 
 Hermes administration route guard
 
-Supersedes README.md's historical profile-lock policy. The public tool name and argv-only JSON shape are unchanged. Caller must still be coding; targets may be any profile. No profile selectors are injected, normalized or removed from the executed argv.
+Supersedes README.md's historical profile-lock policy. The public tool name and argv-only JSON shape are unchanged. Any profile that enables the plugin may call it, and targets may be any profile. No profile selectors are injected, normalized or removed from the executed argv.
 
 Installed host --version and --help inspected: v0.22.2, local d923a5eb487a. Source inspected: hermes_cli/main.py dispatch and profile pre-parser, _parser.py global flags, subcommands/gateway.py, mcp.py, peer.py, console.py, sessions.py and send_cmd.py.
 
@@ -67,7 +67,7 @@ Rationale: serve/dashboard/desktop are chat front/backends. ACP and MCP serve ex
 
 Allowed: explicit installed administration roots listed in ADMIN_COMMANDS, including all profile management, config get/set/edit, ordinary auth/model/tools/plugins/settings commands. Gateway restricted to status/list/stop/uninstall/setup/migrate-legacy. MCP restricted to administration verbs in RESTRICTED (bare MCP opens a catalog picker, not agent chat). Peer registry administration/status/stop allowed. Non-chat globals with known arity may precede admin commands. Argument values such as 'chat' in config set remain data. subprocess retains fixed executable, shell=False, DEVNULL stdin, sanitized environment and timeout.
 
-Tests: python -m unittest discover -s /home/shi/.hermes/profiles/coding/plugins/coding-admin -p 'test_*.py' -v
+Tests: python -m unittest discover -s <this-directory> -p 'test_*.py' -v
 All mutation-looking allowed test inputs use mocked subprocesses. Rejection tests assert subprocess was not called. Historical tests asserting the reversed profile lock are retained as test_admin.py.legacy-profile-lock, outside test discovery.
 
 Residual risks: not an OS sandbox. Intentionally unrestricted configuration, plugin installs, MCP discovery/test commands, editor/helper commands, scheduled job configuration and arbitrary admin behavior can execute code or indirectly enable AI. Settings can also select container routing. This policy is direct route prevention, not adversarial denial of all indirect execution. New subcommands within allowed admin families require review on Hermes upgrades. No claim that this is a complete source-level audit of every indirect invocation.

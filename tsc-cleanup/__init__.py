@@ -54,14 +54,23 @@ print(json.dumps({'terminated_container_pids': [pid for pid, descriptor in compi
 '''
 
 
+def _profile_label() -> str:
+    """Docker label value for this bot's profile; no profile name is baked in."""
+    try:
+        from hermes_constants import get_hermes_home, profile_name_for_home
+        return profile_name_for_home(get_hermes_home()) or "default"
+    except ImportError:
+        return "default"
+
+
 def cleanup_coding_compilers(**kwargs):
-    """Sweep coding containers after any tool, including manually launched checks."""
+    """Sweep this bot's containers after any tool, including manually launched checks."""
     if not CLEANUP_LOCK.acquire(blocking=False):
         return
     try:
         listing = subprocess.run(
             ['docker', 'ps', '--filter', 'label=hermes-agent=1',
-             '--filter', 'label=hermes-profile=coding', '--format', '{{.ID}}'],
+             '--filter', f'label=hermes-profile={_profile_label()}', '--format', '{{.ID}}'],
             capture_output=True, text=True, timeout=3, check=True,
         )
         for container_id in listing.stdout.splitlines():
@@ -73,9 +82,9 @@ def cleanup_coding_compilers(**kwargs):
             )
             report = json.loads(cleanup.stdout)
             if report['terminated_container_pids']:
-                LOGGER.warning('Stopped tsc in coding container %s: %s', container_id, report)
+                LOGGER.warning('Stopped tsc in %s container %s: %s', _profile_label(), container_id, report)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        LOGGER.warning('Coding tsc cleanup failed: %s', error)
+        LOGGER.warning('tsc cleanup failed: %s', error)
     finally:
         CLEANUP_LOCK.release()
 
