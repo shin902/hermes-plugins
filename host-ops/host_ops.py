@@ -1,26 +1,27 @@
-"""Bounded host operations for the coding Hermes profile."""
+"""Bounded host operations."""
 from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
+import shutil
 import signal
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-HERMES = "/home/shi/.hermes/hermes-agent/.hermes/bin/hermes"
 DOCKER = "/usr/bin/docker"
 SYSTEMCTL = "/usr/bin/systemctl"
 JOURNALCTL = "/usr/bin/journalctl"
 CWD = "/"
 UNITS = {"hermes-gateway.service", "hermes-logbook-capture.service", "llama-swap.service"}
-PROFILES = {"coding", "default", "logbook", "mail", "finance", "computer-use", "meta-bot", "local"}
 ENDPOINTS = {
     "logbook": "http://127.0.0.1:8788/health",
     "metro": "http://127.0.0.1:8081/status",
@@ -45,6 +46,38 @@ HEX_ID = re.compile(r"^[0-9a-fA-F]{8,64}$")
 PROFILE_PATH = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 MAX_OUTPUT = 65536
 
+
+def _root() -> Path:
+    """Hermes installation root; resolved per call so no install path is baked in."""
+    from hermes_constants import get_default_hermes_root
+    return Path(get_default_hermes_root())
+
+
+def _binary() -> str:
+    """Locate the installed Hermes executable without pinning one layout."""
+    for candidate in (Path.home() / ".hermes/hermes-agent/.hermes/bin/hermes",
+                      shutil.which("hermes"), "/usr/local/bin/hermes"):
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    raise RuntimeError("hermes executable not found; install it or put it on PATH")
+
+
+def _current_profile() -> str:
+    """Profile owning this process; the default profile when the home is the Hermes root."""
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    return profile_name_for_home(get_hermes_home()) or "default"
+
+
+def _profile_home(profile: str) -> Path:
+    """Home of a named profile, or the Hermes root for the default profile."""
+    if not isinstance(profile, str) or not PROFILE_PATH.fullmatch(profile):
+        raise ValueError("invalid profile name")
+    home = _root() if profile == "default" else _root() / "profiles" / profile
+    if not home.is_dir():
+        raise ValueError("profile directory does not exist")
+    return home
+
+
 SCHEMA = {
     "name": "host_ops",
     "description": "Run bounded diagnostics and allowlisted host service, Hermes cron/config, and Docker read-only operations. Each action accepts only its mapped params; mutations require confirm=true and report readback.",
@@ -57,7 +90,7 @@ SCHEMA = {
                 "job_id": {"type": "string", "pattern": "^[0-9a-fA-F]{8,64}$"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "key": {"type": "string", "enum": sorted(CONFIG_TYPES)},
                 "value": {"description": "Boolean, integer, or string validated against the selected config key.", "oneOf": [{"type": "boolean"}, {"type": "integer"}, {"type": "string"}]},
-                "profile": {"type": "string", "enum": sorted(PROFILES)},
+                "profile": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$", "description": "Target profile name (default or a named profile); defaults to the current profile."},
             }, "additionalProperties": False},
         }, "required": ["action", "params"], "additionalProperties": False,
         "x-action-parameters": {
@@ -115,8 +148,8 @@ def _validate(action: Any, params: Any) -> dict[str, Any]:
         raise ValueError("limit must be 1-100")
     if "profile" in p and action not in {"cron_list", "cron_status", "cron_runs", "cron_pause", "cron_resume", "cron_run", "docker_inspect"}:
         raise ValueError("profile is not permitted for this action")
-    if "profile" in p and (not isinstance(p["profile"], str) or p["profile"] not in PROFILES):
-        raise ValueError("profile is not allowlisted")
+    if "profile" in p and (not isinstance(p["profile"], str) or not PROFILE_PATH.fullmatch(p["profile"])):
+        raise ValueError("invalid profile name")
     if action.startswith("cron_") and action not in {"cron_list", "cron_status"} and action != "cron_runs" and not p.get("job_id"):
         raise ValueError("job_id is required")
     if action in {"config_get", "config_set"}:
@@ -132,16 +165,18 @@ def _validate(action: Any, params: Any) -> dict[str, Any]:
                 raise ValueError("config value is outside the allowed enum")
             if isinstance(constraint, tuple) and not constraint[0] <= value <= constraint[1]:
                 raise ValueError("config value is outside the allowed range")
-    if action == "docker_inspect" and (not isinstance(p.get("profile"), str) or p["profile"] not in PROFILES):
-        raise ValueError("profile is not allowlisted")
+    if action == "docker_inspect" and (not isinstance(p.get("profile"), str) or not PROFILE_PATH.fullmatch(p["profile"])):
+        raise ValueError("invalid profile name")
     return p
 
 
 def _env(profile: str | None = None) -> dict[str, str]:
     # Fixed host runtime identity; intentionally do not inherit loader/python injection or credentials.
-    env = {"HOME": "/home/shi", "USER": "shi", "LOGNAME": "shi", "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-           "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "XDG_RUNTIME_DIR": "/run/user/1000",
-           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus", "HERMES_HOME": "/home/shi/.hermes"}
+    uid = os.getuid()
+    user = pwd.getpwuid(uid).pw_name
+    env = {"HOME": str(Path.home()), "USER": user, "LOGNAME": user, "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus", "HERMES_HOME": str(_root())}
     if profile:
         env["HERMES_PROFILE"] = profile
     return env
@@ -202,8 +237,8 @@ def _run(argv: list[str], *, timeout: float = 10, max_bytes: int = MAX_OUTPUT, e
 
 
 def _hermes(profile: str, *args: str) -> tuple[int, str, str]:
-    if profile not in PROFILES: raise ValueError("profile is not allowlisted")
-    return _run([HERMES, "--profile", profile, *args], timeout=25, env=_env(profile))
+    _profile_home(profile)  # validates the profile name and that it exists
+    return _run([_binary(), "--profile", profile, *args], timeout=25, env=_env(profile))
 
 
 def _status(unit: str) -> dict[str, Any]:
@@ -297,10 +332,8 @@ def _parse_json(rc: int, out: str, err: str) -> Any:
     return json.loads(out)
 
 
-def _cron_job_readback(job_id: str, profile: str = "coding") -> dict[str, Any] | None:
-    if profile not in PROFILES: raise ValueError("profile is not allowlisted")
-    profile_dir = Path(f"/home/shi/.hermes/profiles/{profile}")
-    if not profile_dir.is_dir(): raise ValueError("profile directory does not exist")
+def _cron_job_readback(job_id: str, profile: str | None = None) -> dict[str, Any] | None:
+    profile_dir = _profile_home(profile or _current_profile())
     path = profile_dir / "cron/jobs.json"
     if path.stat().st_size > 2_000_000:
         raise RuntimeError("cron registry exceeds read limit")
@@ -353,17 +386,17 @@ def handle(args: dict[str, Any], **kwargs: Any) -> str:
             result={"ok":rc == 0,"unit":p["unit"],"exit":rc,"logs":_redact(out or err)}
         elif action.startswith("service_") or action=="daemon_reload": result=_service_mutation(action,p)
         elif action in {"cron_list", "cron_status", "cron_runs"}:
-            profile=p.get("profile", "coding")
-            if not Path(f"/home/shi/.hermes/profiles/{profile}").is_dir(): raise ValueError("profile directory does not exist")
+            profile=p.get("profile") or _current_profile()
+            _profile_home(profile)
             if action == "cron_runs":
-                argv=[HERMES,"--profile",profile,"cron","runs","--limit",str(p.get("limit",20))]
+                argv=[_binary(),"--profile",profile,"cron","runs","--limit",str(p.get("limit",20))]
                 if p.get("job_id"): argv += [p["job_id"]]
                 rc,out,err=_run(argv,timeout=25,env=_env(profile))
             else: rc,out,err=_hermes(profile,"cron",action.removeprefix("cron_"))
             result={"ok":rc == 0,"exit":rc,"output":_redact(out or err)}
         elif action in {"cron_pause","cron_resume","cron_run"}:
-            profile=p.get("profile", "coding")
-            if not Path(f"/home/shi/.hermes/profiles/{profile}").is_dir(): raise ValueError("profile directory does not exist")
+            profile=p.get("profile") or _current_profile()
+            _profile_home(profile)
             verb=action.removeprefix("cron_"); rc,out,err=_hermes(profile,"cron",verb,p["job_id"])
             if rc: raise RuntimeError(_redact(err or out or f"command exit {rc}"))
             readback=_cron_job_readback(p["job_id"], profile)
@@ -375,12 +408,12 @@ def handle(args: dict[str, Any], **kwargs: Any) -> str:
             # The installed CLI runs synchronously unless it explicitly reports a background dispatch or a future tick.
             result={"ok":verified,"command_output":_redact(out),"registry_readback":readback,"verified":verified,"queued":run_queued,"completed":run_completed,"running_in_background":run_background,"retry_safe":False}
         elif action == "config_get":
-            rc,out,err=_hermes("coding","config","get",p["key"],"--json"); result=_parse_json(rc,out,err)
+            rc,out,err=_hermes(_current_profile(),"config","get",p["key"],"--json"); result=_parse_json(rc,out,err)
         elif action == "config_set":
             value=json.dumps(p["value"],separators=(",",":")) if isinstance(p["value"],(bool,int)) else p["value"]
-            rc,out,err=_hermes("coding","config","set",p["key"],str(value))
+            rc,out,err=_hermes(_current_profile(),"config","set",p["key"],str(value))
             if rc: raise RuntimeError(_redact(err or out))
-            rrc,rout,rerr=_hermes("coding","config","get",p["key"],"--json")
+            rrc,rout,rerr=_hermes(_current_profile(),"config","get",p["key"],"--json")
             if rrc: result={"ok":False,"write_succeeded":True,"verified":False,"retry_safe":False,"error":"config readback failed"}
             else:
                 actual=_parse_json(rrc,rout,rerr); verified=type(actual) is type(p["value"]) and actual==p["value"]
@@ -396,6 +429,16 @@ def handle(args: dict[str, Any], **kwargs: Any) -> str:
         return json.dumps({"ok":False,"error":_redact(type(exc).__name__+": "+str(exc)), **({"verified":False,"retry_safe":False} if mutated else {})},ensure_ascii=False)
 
 
+def _pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | None:
+    if tool_name != "host_ops":
+        return None
+    # A fresh key prevents session/always consent from approving a later host call.
+    return {"action": "approve",
+            "message": "Host operation requires human approval: " + json.dumps(args, ensure_ascii=False),
+            "rule_key": "host_ops:" + uuid.uuid4().hex}
+
+
 def register(ctx: Any) -> None:
+    ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_tool(name="host_ops", toolset="host_ops", schema=SCHEMA, handler=handle,
                       description="Perform bounded host diagnostics and allowlisted host operations.")

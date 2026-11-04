@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,6 +13,14 @@ from unittest import mock
 import importlib.util
 
 _PLUGIN = Path(__file__).resolve().parents[1] / "host_ops.py"
+# The plugin resolves the Hermes root and profile through the runtime; stand it in for tests.
+_ROOT = Path(tempfile.mkdtemp(prefix="host-ops-root-"))
+(_ROOT / "profiles/coding").mkdir(parents=True)
+sys.modules.setdefault("hermes_constants", types.SimpleNamespace(
+    get_hermes_home=lambda: str(_ROOT / "profiles/coding"),
+    get_default_hermes_root=lambda: str(_ROOT),
+    profile_name_for_home=lambda _: "coding",
+))
 _spec = importlib.util.spec_from_file_location("host_ops_plugin", _PLUGIN)
 plugin = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(plugin)
@@ -27,9 +36,23 @@ class HostOpsTests(unittest.TestCase):
     def test_schema_registration_public_api(self):
         class Ctx:
             def register_tool(self, **kw): self.kw=kw
+            def register_hook(self, event, handler): self.hook=(event, handler)
         ctx=Ctx(); plugin.register(ctx)
         self.assertEqual(ctx.kw["name"],"host_ops")
         self.assertIs(ctx.kw["handler"],plugin.handle)
+        self.assertEqual(ctx.hook, ("pre_tool_call", plugin._pre_tool_call))
+
+    def test_every_host_action_requires_fresh_approval_but_git_is_untouched(self):
+        keys = set()
+        for action in plugin.ACTIONS:
+            for _ in range(2):
+                directive = plugin._pre_tool_call("host_ops", {"action": action, "params": {}})
+                self.assertEqual(directive["action"], "approve")
+                self.assertIn(action, directive["message"])
+                self.assertNotIn(directive["rule_key"], keys)
+                keys.add(directive["rule_key"])
+        for name in ("terminal", "host_github", "read_file"):
+            self.assertIsNone(plugin._pre_tool_call(name, {"command": "git status"}))
 
     def test_strict_validation(self):
         for payload in [
@@ -97,8 +120,9 @@ class HostOpsTests(unittest.TestCase):
         self.assertEqual(plugin._validate("cron_status",{"profile":"coding"}),{"profile":"coding"})
         with self.assertRaises(ValueError): plugin._validate("config_get",{"key":"terminal.backend","profile":"default"})
 
+    @mock.patch.object(plugin,"_profile_home",return_value=Path("/tmp/profile"))
     @mock.patch.object(plugin,"_hermes",return_value=(4,"","failed"))
-    def test_cron_read_only_nonzero_exit_is_not_ok(self, hermes):
+    def test_cron_read_only_nonzero_exit_is_not_ok(self, hermes, profile_home):
         result=json.loads(plugin.handle({"action":"cron_status","params":{}}))
         self.assertFalse(result["ok"]); self.assertFalse(result["result"]["ok"])
 
@@ -121,9 +145,10 @@ class HostOpsTests(unittest.TestCase):
         result=plugin._service_mutation("service_start",{"unit":"hermes-gateway.service"})
         self.assertFalse(result["verified"]); self.assertFalse(result["retry_safe"])
 
+    @mock.patch.object(plugin,"_profile_home",return_value=Path("/tmp/profile"))
     @mock.patch.object(plugin,"_cron_job_readback",return_value={"id":"abcdef12","enabled":True,"next_run_at":"2026-10-13T00:00:00+00:00"})
     @mock.patch.object(plugin,"_hermes")
-    def test_cron_run_uses_installed_cli_completion_semantics(self, hermes, readback):
+    def test_cron_run_uses_installed_cli_completion_semantics(self, hermes, readback, profile_home):
         hermes.return_value=(0,"Triggered job\nRan now: succeeded.", "")
         result=json.loads(plugin.handle({"action":"cron_run","params":{"job_id":"abcdef12","confirm":True}}))
         self.assertTrue(result["ok"]); data=result["result"]
@@ -148,7 +173,8 @@ class HostOpsTests(unittest.TestCase):
         with mock.patch.dict(os.environ,{"LD_PRELOAD":"bad.so","PYTHONPATH":"/tmp/bad","TOKEN":"secret"}):
             env=plugin._env("coding")
         self.assertNotIn("LD_PRELOAD",env); self.assertNotIn("PYTHONPATH",env); self.assertNotIn("TOKEN",env)
-        self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"],"unix:path=/run/user/1000/bus")
+        self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"],f"unix:path=/run/user/{os.getuid()}/bus")
+        self.assertEqual(env["HERMES_HOME"],str(_ROOT))
 
 
 if __name__ == "__main__": unittest.main()

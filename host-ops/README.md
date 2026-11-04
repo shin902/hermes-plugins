@@ -1,8 +1,16 @@
 # host-ops
 
-Coding-profile Hermes plugin exposing one `host_ops(action, params)` tool. It uses only the public `register(ctx)` / `ctx.register_tool(...)` API. Every operation is selected from an allowlist, launched with fixed executable paths and argument arrays (`shell=False`), bounded by output and timeout limits, and run with a deterministic environment that excludes inherited `LD_PRELOAD`, `PYTHONPATH`, and ambient credentials. Its working directory is the fixed coding profile directory.
+Hermes plugin exposing one `host_ops(action, params)` tool. It uses only the public `register(ctx)` / `ctx.register_tool(...)` API. Every operation is selected from an allowlist, launched with fixed executable paths and argument arrays (`shell=False`), bounded by output and timeout limits, and run with a deterministic environment that excludes inherited `LD_PRELOAD`, `PYTHONPATH`, and ambient credentials. Its working directory is `/`; profile-scoped actions default to the calling profile.
 
 ## Actions
+
+Every `host_ops` call, including reads, requests human approval through the documented
+`pre_tool_call` hook. Each call uses a fresh rule key so a previous session/always
+approval cannot authorize another call. `approvals.mode: smart` is supported: plugin
+approval requests go directly to the human gate, not the auxiliary LLM. Hermes's
+`off`/YOLO and unattended approval policies can bypass the standard gate.
+This hook does not escalate `terminal` (including sandbox Git) or `host_github`.
+The plugin does not supply host-authenticated Git fetch/push.
 
 - `host_diagnostics`: bounded CPU/memory information, top 20 process rows, TCP listening ports and GPU summaries (`nvidia-smi` or `/opt/rocm/bin/rocminfo` when present).
 - `health_check`: fixed GET-only localhost probes: `logbook` (`127.0.0.1:8788/health`), `metro` (`127.0.0.1:8081/status`), `preview` (`127.0.0.1:8082/`), and `strata` (`127.0.0.1:8080/health`). Redirects are rejected, the body is capped at 4 KiB, and timeout is 3 seconds. No caller URL, headers, method, or path is accepted.
@@ -13,16 +21,16 @@ Coding-profile Hermes plugin exposing one `host_ops(action, params)` tool. It us
 
 ## Scope and limits
 
-This plugin supplies host diagnostics and narrow service controls for later sandboxed coding terminal work. It does not implement authenticated Git transport. A safe future design needs a protected bare-transport broker; a push wrapper would trust writable `.git/config`, SSH commands, helpers, and hooks. It does not launch GPU benchmarks or inference from caller-selected scripts; a future trusted benchmark runner must own those workloads. These omissions mean this is not a complete migration of every host operation.
+This plugin supplies host diagnostics and narrow service controls for sandboxed coding terminal work. Git, issues and PRs belong to the separate `host-github` plugin, whose direct host Git explicitly trusts checkout configuration and hooks. This plugin does not launch GPU benchmarks or inference from caller-selected scripts. It is not a complete migration of every host operation.
 
 The audit log stores only UTC timestamp, validated action name, and success boolean in `audit/calls.jsonl` with private permissions; malformed parameters and output are excluded. `confirm: true` is a validation gate and does not itself constitute interactive human approval.
 
 ## Install/activate
 
-The plugin is present at `~/.hermes/profiles/coding/plugins/host-ops` but was not enabled. Activation command (not executed):
+Install it in any profile's plugin directory and enable it there:
 
 ```sh
-hermes --profile coding plugins enable host-ops
+hermes plugins enable host-ops
 ```
 
 No Hermes configuration, enabled plugin list, live service, GitHub repository, or device was changed during verification.
@@ -30,8 +38,8 @@ No Hermes configuration, enabled plugin list, live service, GitHub repository, o
 ## Verify
 
 ```sh
-python -m unittest discover -s ~/.hermes/profiles/coding/plugins/host-ops/tests -v
-hermes --profile coding plugins doctor ~/.hermes/profiles/coding/plugins/host-ops --ci
+python -m unittest discover -s <this-directory>/tests -v
+hermes plugins doctor <this-directory> --ci
 ```
 
 Tests use local child processes and mocks; they do not mutate host services, cron registry, config, Docker, network services, GitHub, or devices. The test suite passed in the coding sandbox. The sandbox doctor invocation could not complete because Hermes attempted writes to read-only install locks (`.prepare.lock` and `.install.lock`); this is a sandbox limitation, not a plugin defect.

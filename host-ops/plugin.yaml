@@ -5,3 +5,5 @@ author: Coding
 kind: standalone
 provides_tools:
   - host_ops
+provides_hooks:
+  - pre_tool_call
