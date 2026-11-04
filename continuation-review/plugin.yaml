@@ -1,0 +1,7 @@
+name: continuation-review
+version: 0.1.0
+description: Uses TypeSafe Jev after completed turns to continue explicitly authorized unfinished work in the same session.
+author: Coding
+kind: standalone
+provides_hooks:
+  - post_llm_call

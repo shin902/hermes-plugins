@@ -1,0 +1,5 @@
+name: codex-usage
+version: 1.0.0
+description: "Codex usage snapshot, resumable task queue, and explicit session resume CLI."
+author: "Hermes plugins"
+kind: standalone

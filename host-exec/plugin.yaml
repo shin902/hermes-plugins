@@ -1,0 +1,9 @@
+name: host-exec
+version: 1.0.0
+description: Human-approved arbitrary host shell commands.
+author: Coding
+kind: standalone
+provides_tools:
+  - host_exec
+provides_hooks:
+  - pre_tool_call

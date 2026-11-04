@@ -1,0 +1,8 @@
+name: webpush
+version: 0.1.0
+description: "Mirror Hermes cron notifications to the Home PWA over Web Push."
+author: "shin902"
+kind: standalone
+provides_hooks:
+  - post_llm_call
+  - on_session_end

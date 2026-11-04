@@ -1,0 +1,4 @@
+name: secbrief
+version: 0.1.0
+kind: standalone
+description: "Skill-only operations guide for an existing local secbrief checkout: one-shot inventory, cycle status, report review, coverage limits, and explicit consent boundaries. No tools, scheduling, online scans, or remediation."
