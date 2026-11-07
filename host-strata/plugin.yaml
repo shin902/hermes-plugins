@@ -1,0 +1,8 @@
+name: host-strata
+version: 1.0.0
+description: Build, test, serve and run the .venv Python of a local Strata checkout on the host.
+author: Coding
+kind: standalone
+provides_tools:
+  - host_strata
+  - python_cli
