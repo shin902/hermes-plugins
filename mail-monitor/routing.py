@@ -47,7 +47,12 @@ def route_key(home,mail,lookup=github):
     key=f'github:{repo}:item:{item[1]}' if repo and item else fallback
     commit=re.match(r'^(?:Re: )?\[[^\]]+\] PR run failed: .+ \(([a-f\d]{7,40})\)\s*$',mail.get('subject',''),re.I)
     if not repo or not commit: return key
-    pulls=lookup(home,f'/repos/{repo}/commits/{commit[1]}/pulls?per_page=100')
+    try:
+        pulls=lookup(home,f'/repos/{repo}/commits/{commit[1]}/pulls?per_page=100')
+    except urllib.error.HTTPError as exc:
+        # Deleted/inaccessible commits cannot resolve to a PR; retain sender routing.
+        if exc.code not in (404, 422): raise
+        return key
     if len(pulls)>=100: return key
     numbers={p['number'] for p in pulls if p.get('base',{}).get('repo',{}).get('full_name','').lower()==repo and isinstance(p.get('number'),int) and not isinstance(p['number'],bool) and 0<p['number']<=9007199254740991}
     return f'github:{repo}:item:{next(iter(numbers))}' if len(numbers)==1 else key

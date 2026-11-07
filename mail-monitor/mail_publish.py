@@ -5,7 +5,7 @@ import json
 from .settings import home, settings
 
 SCHEMA = {
-    'name':'mail_publish','description':'Publish the current mail summary to its fixed Discord destination, then mark Outlook read only after confirmed send. Use current batch_id. If success=false do not blindly retry.',
+    'name':'mail_publish','description':'Save the current mail summary durably; Discord is optional and controlled by configuration. Use current batch_id. Never marks Outlook read. If success=false do not blindly retry.',
     'parameters':{'type':'object','properties':{'batch_id':{'type':'string'},'summary':{'type':'string','description':'Japanese summary, max 1750 characters. No mentions or media.'}},'required':['batch_id','summary'],'additionalProperties':False}}
 
 

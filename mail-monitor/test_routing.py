@@ -27,6 +27,14 @@ class RoutingTests(unittest.TestCase):
     def test_commit(self):
         m=self.mail('[Owner/Repo] PR run failed: CI (abc1234)')
         self.assertEqual(routing.route_key(self.home,m,lambda *a:[{'number':19,'base':{'repo':{'full_name':'Owner/Repo'}}}]),'github:owner/repo:item:19')
+    def test_missing_commit_falls_back(self):
+        import urllib.error
+        m=self.mail('[Owner/Repo] PR run failed: CI (abc1234)')
+        for code in (404,422):
+            def fail(*args): raise urllib.error.HTTPError('https://api.github.com',code,'fixture',{},None)
+            self.assertEqual(routing.route_key(self.home,m,fail),'mail:notifications@github.com')
+        def unauthorized(*args): raise urllib.error.HTTPError('https://api.github.com',401,'fixture',{},None)
+        with self.assertRaises(urllib.error.HTTPError): routing.route_key(self.home,m,unauthorized)
     def test_ambiguous_commit(self):
         m=self.mail('[Owner/Repo] PR run failed: CI (abc1234)')
         self.assertEqual(routing.route_key(self.home,m,lambda *a:[{'number':n,'base':{'repo':{'full_name':'Owner/Repo'}}} for n in [1,2]]),'mail:notifications@github.com')

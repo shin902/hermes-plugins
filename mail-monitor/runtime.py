@@ -40,18 +40,40 @@ def graph(home, path, method='GET', body=None):
     if r.returncode: raise RuntimeError('Graph collection/authentication failed')
     return json.loads(r.stdout)
 
-def acknowledge(home, mail_id):
-    graph(home, '/me/messages/'+quote(mail_id, safe=''), 'PATCH', {'isRead':True})
-    if graph(home, '/me/messages/'+quote(mail_id,safe='')+'?$select=isRead').get('isRead') is not True:
+def receipt_read(receipt):
+    # Historical receipts predate the explicit `read` field; their successful
+    # automatic Graph ACK remains the only available read signal. Never rewrite
+    # those receipts in bulk just to add the new field.
+    if 'read' in receipt: return receipt['read'] is True
+    return receipt.get('acknowledged') is True
+
+def acknowledge(home, mail_id, graph_fn=graph):
+    """Explicit user-initiated Graph read mark, with read-back verification.
+
+    Only the site's explicit mail click calls this. Collection, publication and
+    their retry paths must never call it.
+    """
+    path = '/me/messages/'+quote(mail_id, safe='')
+    graph_fn(home, path, 'PATCH', {'isRead':True})
+    if graph_fn(home, path+'?$select=isRead').get('isRead') is not True:
         raise RuntimeError('Graph acknowledgement verification failed')
 
-def collect(home, fetch=graph, ack=acknowledge):
+def mark_read(home, mail_id, graph_fn=graph):
+    # Share the collector's lock, including its Graph token-cache writes.
+    with locked(home) as (p,s):
+        receipt = s['delivered'].get(mail_id)
+        if not receipt or not receipt.get('record'):
+            raise FileNotFoundError('Unknown delivered mail')
+        acknowledge(home, mail_id, graph_fn=graph_fn)
+        receipt['read'] = True
+        receipt['acknowledged'] = True
+        write(p,s)
+
+def collect(home, fetch=graph):
     from .routing import route_key
     with locked(home) as (p,s):
-        # Delivery and Outlook acknowledgement are separate. Retry only ACK after confirmed send.
-        for mid, receipt in s['delivered'].items():
-            if not receipt.get('acknowledged'):
-                ack(home, mid); receipt['acknowledged'] = True; write(p,s)
+        # Background collection never changes Graph read state. Delivered unread
+        # mail stays in receipts and the known set below prevents re-queueing it.
         known = set(s['delivered']) | {m['id'] for m in s['pending']}
         if s['current']: known.add(s['current']['mail']['id'])
         path = '/me/mailFolders/inbox/messages?$top=20&$select=id,subject,from,receivedDateTime&$filter=isRead%20eq%20false'
@@ -66,7 +88,6 @@ def collect(home, fetch=graph, ack=acknowledge):
                 body = details.get('body',{})
                 if body.get('contentType','text').lower() != 'text': raise RuntimeError('Graph did not return text body')
                 text = body.get('content','')
-                if len(text) > 24000: text = text[:24000]+'\n[本文は24000文字で切り詰め]'
                 ea = m.get('from',{}).get('emailAddress',{})
                 mail = {'id':mid, 'subject':m.get('subject',''), 'from':ea, 'received':m.get('receivedDateTime',''), 'body':text, 'webLink':details.get('webLink',''), 'headers':details.get('internetMessageHeaders',[])}
                 mail['route_key'] = route_key(home,mail)
@@ -91,7 +112,10 @@ def prepare(home):
             s['current'] = current
         if not current: return EMPTY
         s['generation'] += 1; write(p,s)
-        return json.dumps({'batch_id':current['batch_id'],'attempt':s['generation'],'mail':current['mail']},ensure_ascii=False)
+        view = dict(current['mail'])
+        if len(view['body']) > 24000:
+            view['body'] = view['body'][:24000] + '\n[要約用本文は24000文字で切り詰め。保存本文は全文]'
+        return json.dumps({'batch_id':current['batch_id'],'attempt':s['generation'],'mail':view},ensure_ascii=False)
 
 def send(home,target,text):
     # Shared transport is owned by default; never copy its bot token into mail profile.
@@ -101,9 +125,14 @@ def send(home,target,text):
     if r.returncode: raise RuntimeError('Discord delivery failed or unknown')
     return data
 
-def publish(home, batch_id, summary, execution_id, target, sender=send, ack=acknowledge, thread_resolver=None):
+def publish(home, batch_id, summary, execution_id, target, sender=send, thread_resolver=None, notifications=None):
     from .routing import ensure_thread
     thread_resolver = thread_resolver or ensure_thread
+    if notifications is None:
+        from .settings import settings
+        notifications = settings().get('discord_notifications', True)
+    if type(notifications) is not bool:
+        raise ValueError('Invalid notification policy')
     if not execution_id or not re.fullmatch(r'discord:\d+',target): raise ValueError('Owned execution and fixed target required')
     if not isinstance(summary,str) or not 1 <= len(summary.strip()) <= 1750: raise ValueError('Summary must be 1..1750 characters')
     if re.search(r'MEDIA:|@everyone|@here|<@|\[\[as_document\]\]',summary,re.I): raise ValueError('Mentions/media forbidden')
@@ -111,11 +140,21 @@ def publish(home, batch_id, summary, execution_id, target, sender=send, ack=ackn
     with locked(home) as (p,s):
         for mid,r in s['delivered'].items():
             if r['batch_id'] == batch_id:
-                return {'success':True,'already_delivered':True,'acknowledged':r.get('acknowledged',False),'message_id':r['message_id']}
+                return {'success':True,'already_delivered':True,'read':receipt_read(r),'message_id':r['message_id']}
         c = s['current']
         if not c or c['batch_id'] != batch_id or c['status'] != 'ready': raise ValueError('Batch not ready; do not resend')
         key = c['mail'].get('route_key')
         if not key: raise ValueError('Missing deterministic routing; migration required')
+        if not notifications:
+            # Atomic local publication, same reader contract, no transport calls.
+            receipt = {'batch_id':batch_id, 'message_id':None, 'thread_id':None,
+                       'execution_id':execution_id, 'acknowledged':False, 'read':False,
+                       'route_key':key, 'notification':'disabled',
+                       'record':{'mail':c['mail'], 'summary':summary}}
+            s['delivered'][c['mail']['id']] = receipt
+            s['current'] = None
+            write(p,s)
+            return {'success':True, 'message_id':None, 'read':False, 'notification':'disabled'}
         parent = target.split(':')[1]
         thread_id = thread_resolver(home,key,parent)
         c.update(status='sending',execution_id=execution_id,summary=summary,thread_id=thread_id); write(p,s)
@@ -127,10 +166,9 @@ def publish(home, batch_id, summary, execution_id, target, sender=send, ack=ackn
         except BaseException:
             c['status']='unknown'; write(p,s); raise
         mail_id = c['mail']['id']
-        receipt = {'batch_id':batch_id,'message_id':mid,'execution_id':execution_id,'acknowledged':False,'thread_id':thread_id,'route_key':key}
+        # Publication does not acknowledge Outlook. A new receipt starts unread;
+        # only an explicit site click may mark Graph and the archive read.
+        receipt = {'batch_id':batch_id,'message_id':mid,'execution_id':execution_id,'acknowledged':False,'read':False,'thread_id':thread_id,'route_key':key,
+                   'record': {'mail': c['mail'], 'summary': summary}}
         s['delivered'][mail_id] = receipt; s['current'] = None; write(p,s)
-        try:
-            ack(home,mail_id); receipt['acknowledged']=True; write(p,s)
-        except Exception:
-            return {'success':True,'message_id':mid,'acknowledged':False,'note':'Delivered; Graph acknowledgement retained for retry. Never resend.'}
-        return {'success':True,'message_id':mid,'acknowledged':True}
+        return {'success':True,'message_id':mid,'read':False}
