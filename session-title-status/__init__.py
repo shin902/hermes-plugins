@@ -39,6 +39,27 @@ def _profiles() -> dict[str, Path]:
 # The only profiles this handler may address. Keys are model-supplied; values are fixed.
 PROFILES = _profiles()
 
+
+def is_cloud_allowed(profile):
+    """True only when a profile may be sent to a cloud classifier.
+
+    Single source of truth for the local/cloud partition: bot-acl ``groups.yaml``
+    must load as a mapping whose ``local`` key is a list of strings, and the
+    profile must not be in it. Read fresh on every call. Any failure (missing
+    file, no PyYAML, parse error, wrong shape) returns False, so everything stays
+    on the local model.
+    """
+    try:
+        import yaml
+        groups = yaml.safe_load((_root() / 'plugin-config' / 'bot-acl' / 'groups.yaml')
+                                .read_text(encoding='utf-8'))
+        local = groups['local']
+    except Exception:
+        return False
+    if not isinstance(local, list) or not all(isinstance(name, str) for name in local):
+        return False
+    return isinstance(profile, str) and profile not in local
+
 BASE = 'http://127.0.0.1:8642'
 STATES = ('🔴', '📤', '👀', '⏳', '✅')
 SOURCES = ('desktop', 'cli', 'tui')

@@ -3,13 +3,13 @@ import contextlib
 import importlib.util
 import io
 import json
+import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from urllib.parse import parse_qs, unquote, urlparse
 
 spec = importlib.util.spec_from_file_location('status_plugin', Path(__file__).with_name('__init__.py'))
 # The plugin discovers profiles through the Hermes runtime; stand it in before import.
-from plugin_test_support import install_stub
+from plugin_test_support import FakeAPI, install_stub
 install_stub()
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
@@ -18,50 +18,6 @@ p.list_only = lambda: False
 mspec = importlib.util.spec_from_file_location('status_monitor', Path(__file__).with_name('monitor_script.py'))
 monitor = importlib.util.module_from_spec(mspec)
 mspec.loader.exec_module(monitor)
-
-
-class FakeAPI:
-    """Synthetic loopback REST: profiles, sources, latest-6 pages and title PATCH."""
-
-    def __init__(self):
-        self.data = {'default': {}, 'coding': {}}
-        self.messages = {}
-        self.calls = []
-        self.fail_patch = False
-
-    def add(self, sid, profile='default', title='Plan', source='cli', messages=None):
-        self.data[profile][sid] = dict(id=sid, title=title, source=source, archived=False,
-                                       hidden=False, is_internal_child=False, parent_session_id=None,
-                                       last_active='2026-10-22T00:00:00Z')
-        self.messages[(profile, sid)] = list(messages or [{'role': 'user', 'content': 'hello'}])
-
-    def request(self, method, path, body=None, profile='default'):
-        self.calls.append((method, path, body, profile))
-        parsed = urlparse(path)
-        if method == 'GET' and parsed.path == '/api/sessions':
-            query = parse_qs(parsed.query)
-            source = query.get('source', [''])[0]
-            limit = int(query.get('limit', ['50'])[0])
-            offset = int(query.get('offset', ['0'])[0])
-            rows = [s for s in self.data[profile].values() if s['source'] == source]
-            page = rows[offset:offset + limit]
-            return {'data': [dict(s) for s in page], 'has_more': offset + limit < len(rows)}
-        parts = parsed.path.split('/')
-        if method == 'GET' and parsed.path.startswith('/api/sessions/'):
-            sid = unquote(parts[3])
-            if parsed.path.endswith('/messages'):
-                query = parse_qs(parsed.query)
-                limit = int(query.get('limit', ['6'])[0])
-                data = self.messages.get((profile, sid), [])[-limit:]
-                return {'session_id': sid, 'data': [dict(m) for m in reversed(data)]}
-            return {'session': dict(self.data[profile][sid])}
-        if method == 'PATCH':
-            sid = unquote(parts[3])
-            if self.fail_patch:
-                raise OSError('synthetic PATCH failure')
-            self.data[profile][sid]['title'] = body['title']
-            return {}
-        raise AssertionError((method, path))
 
 
 def setup(tmp):
@@ -405,20 +361,54 @@ def test_acknowledgement_credentials_required(tmp):
             raise AssertionError(args)
 
 
+def test_quiet_gate_defers_recent_sessions(tmp):
+    api = setup(tmp)
+    now = 1800000000.0
+    api.add('hot', messages=[{'role': 'user', 'content': 'typing'}])
+    api.add('numstr')
+    api.add('isostr')
+    api.add('cold')
+    api.add('missing')
+    api.add('garbage')
+    api.data['default']['hot']['last_active'] = int(now) - 30          # epoch seconds
+    api.data['default']['numstr']['last_active'] = '%.3f' % (now - 10)  # numeric string
+    api.data['default']['isostr']['last_active'] = datetime.datetime.fromtimestamp(
+        now - 5, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')  # ISO-8601 with Z
+    api.data['default']['cold']['last_active'] = now - 600
+    api.data['default']['missing']['last_active'] = None
+    api.data['default']['garbage']['last_active'] = 'yesterday'
+    api.calls.clear()
+    work, unavailable = monitor.pending_work(plugin=p, now=now)
+    assert unavailable == []
+    assert sorted(x['id'] for x in work) == ['cold', 'garbage', 'missing']
+    # Deferred sessions are skipped before evidence is fetched (no REST call).
+    fetched = ' '.join(c[1] for c in api.calls if '/messages' in c[1])
+    for sid in ('hot', 'numstr', 'isostr'):
+        assert '/%s/messages' % sid not in fetched, fetched
+    # Output contract is unchanged: no new fields, deferred sessions absent.
+    payload = json.loads(monitor.render(plugin=p, now=now))
+    assert sorted(x['id'] for x in payload['pending']) == ['cold', 'garbage', 'missing']
+    assert all('last_active' not in x for x in payload['pending'])
+    # Once quiet, the deferred session is picked up on a later tick.
+    later, _ = monitor.pending_work(plugin=p, now=now + 200)
+    assert 'hot' in [x['id'] for x in later]
+
+
 def run():
     tests = [test_unchanged_and_own_emoji, test_wake_gate_json_and_retry,
              test_gate_error_nonzero_without_payload, test_failed_work_retries,
              test_title_conflict_and_evidence_change, test_checkpoint_conflict_and_idempotent_retry,
              test_checkpoint_token_covers_whole_row, test_profile_isolation,
              test_hash_full_content_and_latest6, test_pagination,
-             test_classifier_version_forces_reclassification, test_acknowledgement_credentials_required]
+             test_classifier_version_forces_reclassification, test_acknowledgement_credentials_required,
+             test_quiet_gate_defers_recent_sessions]
     for test in tests:
         with TemporaryDirectory() as tmp:
             test(tmp)
         print('PASS:', test.__name__)
     print('PASS: differential gate, pending/no-work JSON, retry, fail-closed error, title conflict, '
           'full-row checkpoint CAS/idempotency, profile isolation, full-content hash, pagination, '
-          'version bump, required credentials')
+          'version bump, required credentials, quiet-session deferral')
 
 
 if __name__ == '__main__':

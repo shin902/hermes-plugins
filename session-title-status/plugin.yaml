@@ -1,7 +1,7 @@
 name: session-title-status
 kind: standalone
-version: 1.2.1
-description: Loopback REST session titles for the allowlisted default and named profiles - differential status classification with plugin-data checkpoints, a pre-run wake gate, state status or full rename, title-only writes.
+version: 1.3.0
+description: Loopback REST session titles for the allowlisted default and named profiles - differential status classification with plugin-data checkpoints, a pre-run wake gate, and a privacy-partitioned classifier split (local model for bot-acl local-group profiles, TypeSafe Jev no_agent job for the rest), state status or full rename, title-only writes.
 requires_hermes: ">=0.22.2"
 provides_hooks:
   - pre_api_request

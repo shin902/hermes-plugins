@@ -14,15 +14,75 @@ been deployed.
   It prints `{"wakeAgent":false}` when nothing is pending and
   `{"wakeAgent":true,"pending":[...]}` when work exists. No cycle or timestamp is
   used.
-- `plugin.yaml` — version `1.2.1`.
-- `test_status.py`, `test_diff.py`, `test_diagnostic.py` — run directly
+- `jev_runner.py` — TypeSafe Jev classifier for the cloud-allowed partition, run as a
+  Hermes `no_agent` cron script (see "Two cron jobs" below).
+- `plugin.yaml` — version `1.3.0`.
+- `test_status.py`, `test_diff.py`, `test_diagnostic.py`, `test_jev.py` — run directly
   (`python test_diff.py`, etc.); they use plain asserts, not test discovery.
 - `CRON_PROMPT.md` — the model prompt for the scheduler.
 
+## Two cron jobs, one privacy partition
+
+Sessions are split by `is_cloud_allowed(profile)` in `__init__.py`: a profile is
+cloud-allowed iff `<hermes root>/plugin-config/bot-acl/groups.yaml` loads as a
+mapping, its `local` key is a list of strings, and the profile is not in it. The
+file is read fresh on every call. **Any failure** (missing file, no PyYAML, parse
+error, wrong shape) makes *no* profile cloud-allowed, so everything stays on the
+local model. The Hermes managed Python (PyYAML) must run both jobs.
+
+Note that profiles in no group (e.g. `school`, `deepseek`) count as cloud-allowed;
+only the `local` group is protected.
+
+| job | scope | classifier | entry |
+|---|---|---|---|
+| existing qwen agent job (`2d06e7e7352e`) | `local`: profiles NOT cloud-allowed | local model via `CRON_PROMPT.md` | `monitor_script.py` (gate) |
+| new Jev job | `cloud`: cloud-allowed profiles | TypeSafe Jev, no LLM agent | `jev_runner.py` (`no_agent`) |
+
+`monitor_script.py --scope local|cloud|all` selects the partition; with no
+arguments it is `local`, so the live qwen job stops seeing cloud profiles as soon as
+this version is deployed (its existing `session_status_gate.py` wrapper needs no
+change). The two scopes are disjoint and together cover `all`. Out-of-scope
+sessions are dropped before any evidence fetch.
+
+### Jev job
+
+- Wrapper `~/.hermes/scripts/session_status_jev.py`:
+
+  ```python
+  """Thin entry point; canonical implementation is managed in hermes-plugins."""
+  import runpy
+  runpy.run_path('/home/shi/ghq/github.com/shin902/hermes-plugins/session-title-status/jev_runner.py', run_name='__main__')
+  ```
+- Cron job: `no_agent`, script = that wrapper, same schedule as the qwen job. stdout
+  is delivered verbatim (empty = silent), nonzero exit is an error alert.
+- Needs `TYPESAFE_API_KEY` in the environment or in `<hermes root>/.env` (parsed,
+  never sourced; never printed). Missing key with pending work: exit 1,
+  `JEV_ERROR - - KeyMissing`.
+- Per tick: `monitor_script.pending_work(scope='cloud')` (quiet window applies) ->
+  `inspect` -> one Jev `choice` question (options `unresolved|outbox|review|running|done`
+  = 🔴📤👀⏳✅; state = bounded messages + `truncated` + title without its emoji) ->
+  `set_status` with that inspect's `evidence_hash`/`checkpoint_token`. `set_title`
+  is never called. `is_cloud_allowed` is re-checked right before every network send.
+- Confidence below `MIN_CONFIDENCE = 0.30` becomes 🔴. Calibrated on 40 recent
+  `default`/`coding` sessions (dry-run): Jev confidence did not separate agreement
+  with the qwen titles from disagreement (median 0.65 vs 0.60), so the threshold only
+  drops near-uniform answers (~7-10%).
+- Success output: `<profile>: N changed` per profile, nothing otherwise. A Jev
+  transport/validation error or an `inspect`/`set_status` exception: no `set_status`
+  for that session, other sessions continue, then stderr
+  `JEV_ERROR <profile> <session> <class>` and exit 1. `skipped`, `retry` and
+  `checkpoint conflict` are normal and picked up next tick.
+- `python jev_runner.py --dry-run` prints one JSON line per session (profile, id,
+  title, chosen emoji, jev_choice, confidence, probabilities) and writes nothing;
+  `--recent N --profile P ...` (dry-run only) classifies the N newest eligible
+  sessions regardless of checkpoint, for calibration.
+- Sessions sent to Jev: title-less-emoji + latest <=6 messages (<=12000 chars).
+  Run `--dry-run` once with the production environment before enabling the cron.
+
 ## Parent install: edit the EXISTING cron entry
 
-The parent must edit the existing automation/cron entry; do **not** create a
-second entry.
+The parent must edit the existing automation/cron entry for the qwen job; do **not**
+create a second *agent* entry. The Jev job above is the only additional entry (`no_agent`).
 
 1. Deploy this directory as the `session-title-status` plugin. Keep
    `monitor_script.py` next to `__init__.py`: the script loads its sibling by
@@ -70,6 +130,14 @@ Hermes runs an ordinary `--script` gate before constructing the AIAgent:
 The gate therefore does not depend on output-change detection and has no cycle
 field. While a session stays pending, every scheduled run prints the same
 `wakeAgent:true` payload and launches the model again.
+
+Sessions active within the last 120 seconds (`QUIET_SECONDS`) are deferred: the
+gate skips them entirely — no evidence fetch, no classification — so a
+mid-conversation session is not classified and then rejected with
+`retry: evidence changed` after the model has already spent its run. The
+checkpoint is left untouched, so the session becomes pending again on the first
+tick after it has been quiet for 120 seconds. Missing or unparseable
+`last_active` values are never deferred.
 
 ## Required checks before enabling
 
